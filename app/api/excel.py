@@ -56,6 +56,7 @@ async def preview(sheet: str | None = Query(default=None), file: UploadFile = fi
         "columns": table.columns,
         "rows": table.rows,
         "cached": True,
+        "sha16": digest,
     }
 
 
