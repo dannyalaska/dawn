@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: dawn-api
+    env: python
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install poetry
+      poetry install --no-interaction --no-ansi
+    startCommand: poetry run uvicorn app.api.server:app --host 0.0.0.0 --port 10000
+    runtime:
+      pythonVersion: 3.11
+    envVars:
+      - key: ENV
+        value: dev
+      - key: APP_NAME
+        value: DAWN
+      - key: REDIS_URL
+        sync: false     # set in Render dashboard
+      - key: POSTGRES_DSN
+        sync: false     # set in Render dashboard
+    healthCheckPath: /health
+    autoDeploy: true
