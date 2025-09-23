@@ -1,0 +1,52 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+.envrc
+
+# Local environment variables
+.env
+*.env
+
+# Coverage / testing
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Editor / IDE junk
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# Alembic artifacts
+alembic.ini
+infra/alembic/*.pyc
+infra/alembic/__pycache__/
+
+# Streamlit cache
+.streamlit/
+.streamlit_app/__pycache__/
+
+# OS junk
+.DS_Store
+Thumbs.db
