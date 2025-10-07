@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.excel import router as excel_router
+from app.api.rag import router as rag_router
 from app.core.config import settings
 from app.core.redis_client import redis_async
 
@@ -34,3 +35,4 @@ async def health_redis():
 
 
 app.include_router(excel_router)
+app.include_router(rag_router)

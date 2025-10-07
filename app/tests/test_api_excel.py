@@ -3,40 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 
 import pandas as pd
-import pytest
 from fastapi.testclient import TestClient
-
-
-# --- Fake Redis with get/setex API ---
-class _FakeRedis:
-    def __init__(self) -> None:
-        self._store: dict[str, str] = {}
-
-    def get(self, k: str):
-        return self._store.get(k)
-
-    def setex(self, k: str, _ttl: int, v: str):
-        self._store[k] = v
-        return True
-
-
-@pytest.fixture(autouse=True)
-def _isolate_env(tmp_path, monkeypatch):
-    # Point DB at temp sqlite, isolate from dev DB
-    monkeypatch.setenv("POSTGRES_DSN", f"sqlite:///{tmp_path / 'test.sqlite3'}")
-
-    # Swap redis client with fake
-    from app.core import redis_client as rc
-
-    rc.redis_sync = _FakeRedis()  # type: ignore[attr-defined]
-
-    # Create tables just for this test DB
-    from app.core.db import Base, get_engine
-
-    eng = get_engine()
-    Base.metadata.create_all(bind=eng)
-    yield
-    Base.metadata.drop_all(bind=eng)
 
 
 def _xlsx_bytes() -> bytes:

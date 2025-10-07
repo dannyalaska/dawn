@@ -1,24 +1,29 @@
-from pydantic_settings import BaseSettings
+from __future__ import annotations
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    ENV: str = "dev"
+    # Pydantic v2 style: use model_config, not inner Config
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",  # ignore unknown env keys instead of erroring
+        case_sensitive=False,
+    )
+
+    # Core app
     APP_NAME: str = "DAWN"
-    PORT: int = 8000
+    ENV: str = "dev"
 
-    POSTGRES_DSN: str | None = None
+    # Infra
+    REDIS_URL: str = "redis://127.0.0.1:6379/0"
+    POSTGRES_DSN: str | None = None  # e.g. postgresql+psycopg2://user:pass@host/db?sslmode=require
 
-    AWS_REGION: str | None = None
-    AWS_ACCESS_KEY_ID: str | None = None
-    AWS_SECRET_ACCESS_KEY: str | None = None
-    S3_BUCKET: str | None = None
-    S3_ENDPOINT_URL: str | None = None
-
-    REDIS_URL: str = "redis://localhost:6379/1"
-
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    # LLM knobs (safe defaults; can be overridden via .env)
+    LLM_PROVIDER: str = "stub"  # stub | ollama | openai
+    OPENAI_API_KEY: str | None = None
+    OPENAI_MODEL: str | None = "gpt-4o-mini"
+    OLLAMA_MODEL: str | None = "llama3.1"
 
 
 settings = Settings()
