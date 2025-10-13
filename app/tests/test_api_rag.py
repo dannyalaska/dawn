@@ -3,6 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
@@ -19,6 +20,20 @@ def _xlsx_bytes() -> bytes:
             "Client": ["Client A", "Client B", "Client A"],
             "Category": ["Login", "Billing", "Login"],
             "Severity": ["P1", "P2", "P3"],
+        }
+    )
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Sheet1")
+    return buf.getvalue()
+
+
+def _resolver_xlsx_bytes() -> bytes:
+    df = pd.DataFrame(
+        {
+            "Assigned_To": ["Alex", "Priya", "Alex", "Sam"],
+            "Resolution_Time_Hours": [12, 5, 18, 7],
+            "Ticket_ID": ["T1", "T2", "T3", "T4"],
         }
     )
     buf = BytesIO()
@@ -69,6 +84,9 @@ def test_rag_index_saves_summary_and_chunks(client, monkeypatch):
 
     # Summary chunk should exist (row_index == -1)
     assert captured["chunks"][0].row_index == -1
+    assert summary.get("insights")
+    assert summary.get("relationships")
+    assert summary.get("analysis_plan")
 
     with session_scope() as s:
         rec = s.execute(
@@ -136,3 +154,146 @@ def test_rag_chat_appends_history(client, monkeypatch):
     data = resp.json()
     assert data["messages"][-1]["role"] == "assistant"
     assert "Answer to Second question" in data["messages"][-1]["content"]
+
+
+def test_context_endpoints(client, monkeypatch):
+    import app.core.rag as rag_module
+
+    fake_redis = rag_module.redis_sync
+    doc_id = "manual0001"
+    key = rag_module._doc_key(doc_id)
+    fake_redis.hset(
+        key,
+        mapping={
+            "text": "Original context",
+            "source": "demo:Sheet1",
+            "row_index": "1",
+            "type": "excel",
+            rag_module.VEC_FIELD: b"",
+        },
+    )
+
+    monkeypatch.setattr(
+        "app.core.rag.embed_texts",
+        lambda texts: np.zeros((len(texts), 384), dtype=np.float32),
+    )
+    monkeypatch.setattr("app.core.rag._ensure_index", lambda *args, **kwargs: None)
+
+    list_resp = client.get("/rag/context", params={"source": "demo:Sheet1"})
+    assert list_resp.status_code == 200, list_resp.text
+    assert list_resp.json()["count"] >= 1
+
+    update_resp = client.put(
+        f"/rag/context/{doc_id}",
+        json={"text": "Updated context text"},
+    )
+    assert update_resp.status_code == 200, update_resp.text
+    stored = fake_redis.hgetall(key)
+    assert stored["text"] == "Updated context text"
+
+    note_resp = client.post(
+        "/rag/context/note",
+        json={"source": "demo:Sheet1", "text": "Vendor IDs map to cb_id."},
+    )
+    assert note_resp.status_code == 200, note_resp.text
+    created = note_resp.json()["created"]
+    assert created["type"] == "note"
+    assert created["text"]
+    assert created["source"] == "demo:Sheet1"
+
+    final_resp = client.get("/rag/context", params={"source": "demo:Sheet1"})
+    assert final_resp.status_code == 200, final_resp.text
+    final_chunks = final_resp.json()["chunks"]
+    assert final_resp.json()["count"] >= 2
+    assert any(c["type"] == "note" and c["text"] for c in final_chunks)
+
+
+def test_memory_endpoints(client, monkeypatch):
+    from app.core.db import session_scope
+    from app.core.models import Upload
+
+    content = _xlsx_bytes()
+    files = {
+        "file": (
+            "test.xlsx",
+            content,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    }
+    monkeypatch.setattr("app.core.rag._ensure_index", lambda *args, **kwargs: None)
+
+    resp = client.post("/rag/index_excel", files=files)
+    assert resp.status_code == 200
+    payload = resp.json()
+    sha = payload["sha16"]
+
+    mem_resp = client.get("/rag/memory", params={"sha16": sha, "sheet": "Sheet1"})
+    assert mem_resp.status_code == 200, mem_resp.text
+    memory = mem_resp.json()
+    assert memory["relationships"]
+    assert isinstance(memory["analysis_plan"], list)
+
+    new_relationships = {"Assigned_To": "resolver", "Category": "category"}
+    update_resp = client.put(
+        "/rag/memory",
+        json={"sha16": sha, "sheet": "Sheet1", "relationships": new_relationships},
+    )
+    assert update_resp.status_code == 200, update_resp.text
+
+    with session_scope() as s:
+        rec = (
+            s.execute(
+                select(Upload)
+                .where(Upload.sha16 == sha, Upload.sheet == "Sheet1")
+                .order_by(Upload.uploaded_at.desc())
+            )
+            .scalars()
+            .first()
+        )
+        assert rec is not None
+        assert rec.summary.get("relationships") == new_relationships
+
+
+def test_chat_uses_summary_metrics(client, monkeypatch):
+    monkeypatch.setattr("app.core.rag._ensure_index", lambda *args, **kwargs: None)
+
+    files = {
+        "file": (
+            "resolver.xlsx",
+            _resolver_xlsx_bytes(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    }
+    index_resp = client.post("/rag/index_excel", files=files)
+    assert index_resp.status_code == 200, index_resp.text
+
+    monkeypatch.setattr(
+        "app.api.rag.search",
+        lambda *_args, **_kwargs: [
+            {
+                "key": "resolver:summary",
+                "source": "resolver.xlsx:Sheet1:summary",
+                "text": "Summary chunk",
+                "row_index": -1,
+                "score": 0.1,
+            }
+        ],
+    )
+
+    chat_payload = {
+        "messages": [
+            {"role": "user", "content": "Who resolved the most tickets?"},
+        ]
+    }
+    chat_resp = client.post("/rag/chat", json=chat_payload)
+    assert chat_resp.status_code == 200, chat_resp.text
+    assert "Alex" in chat_resp.json()["answer"]
+
+    chat_payload_fast = {
+        "messages": [
+            {"role": "user", "content": "Who resolves tickets the fastest?"},
+        ]
+    }
+    chat_resp_fast = client.post("/rag/chat", json=chat_payload_fast)
+    assert chat_resp_fast.status_code == 200, chat_resp_fast.text
+    assert "Priya" in chat_resp_fast.json()["answer"]

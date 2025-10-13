@@ -1,0 +1,701 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Iterable
+from difflib import SequenceMatcher
+from hashlib import sha256
+from io import BytesIO
+from typing import Any
+
+import pandas as pd
+import requests
+from sqlalchemy import func, select
+
+from app.core.db import session_scope
+from app.core.dq import sync_auto_rules
+from app.core.excel.summary import ColumnSummary, DatasetMetric, summarize_dataframe
+from app.core.models import Feed, FeedVersion
+from app.core.rag import Chunk, simple_chunker, upsert_chunks
+from app.core.redis_client import redis_sync
+from app.core.storage import bucket_name, s3
+
+
+class FeedIngestError(Exception):
+    """Raised when feed ingestion cannot proceed."""
+
+
+FEED_SOURCE_KINDS = {"upload", "s3", "http"}
+DATA_FORMATS = {"excel", "csv"}
+
+
+def _infer_format(filename: str | None, declared: str | None) -> str:
+    if declared and declared.lower() in DATA_FORMATS:
+        return declared.lower()
+    if filename:
+        fname = filename.lower()
+        if fname.endswith((".xlsx", ".xlsm", ".xls")):
+            return "excel"
+        if fname.endswith(".csv"):
+            return "csv"
+    return "excel"
+
+
+def _ensure_kind(kind: str) -> str:
+    k = kind.lower()
+    if k not in FEED_SOURCE_KINDS:
+        raise FeedIngestError(
+            f"Unsupported source_type {kind!r}. Expected one of {sorted(FEED_SOURCE_KINDS)}."
+        )
+    return k
+
+
+def _load_excel(content: bytes, sheet: str | None) -> pd.DataFrame:
+    xl = pd.ExcelFile(BytesIO(content))
+    target_sheet = sheet or xl.sheet_names[0]
+    if target_sheet not in xl.sheet_names:
+        raise FeedIngestError(
+            f"Sheet {target_sheet!r} not found. Available sheets: {', '.join(xl.sheet_names)}."
+        )
+    return xl.parse(target_sheet)
+
+
+def _load_csv(content: bytes) -> pd.DataFrame:
+    return pd.read_csv(BytesIO(content))
+
+
+def _fetch_s3_bytes(path: str | None) -> bytes:
+    if not path:
+        raise FeedIngestError("s3_path must be provided for source_type='s3'.")
+    bucket = None
+    key = path
+    if path.startswith("s3://"):
+        without = path[len("s3://") :]
+        if "/" not in without:
+            raise FeedIngestError("s3_path must include an object key, e.g. s3://bucket/key.xlsx")
+        bucket, key = without.split("/", 1)
+    if bucket is None or not bucket:
+        bucket = bucket_name()
+    client = s3()
+    resp = client.get_object(Bucket=bucket, Key=key)
+    body = resp.get("Body")
+    if body is None:
+        raise FeedIngestError(f"Empty S3 object for path {path!r}")
+    return body.read()
+
+
+def _fetch_http_bytes(url: str | None) -> bytes:
+    if not url:
+        raise FeedIngestError("http_url must be provided for source_type='http'.")
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        raise FeedIngestError(f"Failed to download {url!r}: {exc}") from exc
+    return resp.content
+
+
+def _collect_existing_columns(exclude_identifier: str | None) -> list[dict[str, str]]:
+    with session_scope() as s:
+        stmt = (
+            select(Feed.identifier, FeedVersion.schema_)
+            .join(FeedVersion, Feed.id == FeedVersion.feed_id)
+            .order_by(FeedVersion.created_at.desc())
+        )
+        rows = s.execute(stmt).all()
+    seen: list[dict[str, str]] = []
+    for identifier, schema_json in rows:
+        if exclude_identifier and identifier == exclude_identifier:
+            continue
+        if not schema_json:
+            continue
+        columns = schema_json.get("columns") if isinstance(schema_json, dict) else None
+        if not columns or not isinstance(columns, list):
+            continue
+        for col in columns:
+            name = str(col.get("name", ""))
+            dtype = str(col.get("dtype", ""))
+            if not name:
+                continue
+            seen.append({"feed_identifier": identifier, "column": name, "dtype": dtype})
+    return seen
+
+
+def _looks_like_id(name: str) -> bool:
+    lowered = name.lower()
+    return lowered == "id" or lowered.endswith("_id") or "id" in lowered.split("_")
+
+
+def _infer_foreign_keys(
+    columns: list[dict[str, Any]],
+    existing_columns: Iterable[dict[str, str]],
+    current_identifier: str,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for col in columns:
+        col_name = str(col["name"])
+        if col.get("is_primary_key_candidate"):
+            continue
+        if not _looks_like_id(col_name):
+            continue
+        matches: list[dict[str, Any]] = []
+        for other in existing_columns:
+            if other["feed_identifier"] == current_identifier:
+                continue
+            score = SequenceMatcher(None, col_name.lower(), other["column"].lower()).ratio()
+            if score >= 0.78:
+                matches.append(
+                    {
+                        "feed_identifier": other["feed_identifier"],
+                        "column": other["column"],
+                        "similarity": round(score, 3),
+                    }
+                )
+        if matches:
+            matches.sort(key=lambda m: m["similarity"], reverse=True)
+            results.append({"column": col_name, "candidates": matches[:5]})
+    return results
+
+
+def _columns_schema(df: pd.DataFrame) -> tuple[list[dict[str, Any]], list[str]]:
+    rows = len(df)
+    columns: list[dict[str, Any]] = []
+    primary_candidates: list[str] = []
+
+    for col in df.columns:
+        series = df[col]
+        non_null = int(series.notna().sum())
+        null_percent = float(((rows - non_null) / rows) * 100) if rows else 0.0
+        unique_count = int(series.nunique(dropna=True))
+        unique_percent = float((unique_count / rows) * 100) if rows else 0.0
+        sample_values = [str(v) for v in series.dropna().astype(str).head(5).tolist()]
+        dtype = str(series.dtype)
+        is_primary_candidate = bool(
+            rows
+            and non_null == rows
+            and unique_count == rows
+            and not pd.api.types.is_float_dtype(series)
+        )
+        if not is_primary_candidate and rows and unique_percent >= 98.0 and null_percent <= 5.0:
+            is_primary_candidate = True
+
+        column_info = {
+            "name": str(col),
+            "dtype": dtype,
+            "null_percent": round(null_percent, 3),
+            "unique_percent": round(unique_percent, 3),
+            "non_null": non_null,
+            "unique_count": unique_count,
+            "sample_values": sample_values,
+            "is_primary_key_candidate": is_primary_candidate,
+        }
+        if is_primary_candidate:
+            primary_candidates.append(str(col))
+        columns.append(column_info)
+
+    return columns, primary_candidates
+
+
+def _column_summaries_to_dict(summaries: Iterable[ColumnSummary]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for item in summaries:
+        data = {
+            "name": item.name,
+            "dtype": item.dtype,
+            "top_values": item.top_values,
+            "stats": item.stats,
+        }
+        serialized.append(data)
+    return serialized
+
+
+def _metrics_to_dict(metrics: Iterable[DatasetMetric]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for metric in metrics:
+        out.append(
+            {
+                "type": metric.type,
+                "column": metric.column,
+                "values": [{"label": label, "count": count} for label, count in metric.values],
+                "description": metric.description,
+            }
+        )
+    return out
+
+
+def _markdown_summary(
+    *,
+    identifier: str,
+    name: str,
+    owner: str | None,
+    source_kind: str,
+    data_format: str,
+    rows: int,
+    cols: int,
+    columns_schema: list[dict[str, Any]],
+    primary_keys: list[str],
+    foreign_keys: list[dict[str, Any]],
+    summary_text: str,
+) -> tuple[str, str]:
+    lines = [
+        f"# Feed {name} (`{identifier}`)",
+        "",
+        f"- Owner: {owner or 'n/a'}",
+        f"- Source type: {source_kind}",
+        f"- Format: {data_format}",
+        f"- Rows: {rows}",
+        f"- Columns: {cols}",
+        "",
+        "## Column Overview",
+        "| Column | Type | Null % | Unique % | Sample Values |",
+        "| --- | --- | ---: | ---: | --- |",
+    ]
+    for col in columns_schema:
+        sample = ", ".join(col.get("sample_values", [])[:3]) or "—"
+        lines.append(
+            f"| `{col['name']}` | {col['dtype']} | {col['null_percent']:.2f} | "
+            f"{col['unique_percent']:.2f} | {sample} |"
+        )
+
+    lines.append("")
+    lines.append("## Primary Key Candidates")
+    if primary_keys:
+        for pk in primary_keys:
+            lines.append(f"- `{pk}`")
+    else:
+        lines.append("- None detected")
+
+    lines.append("")
+    lines.append("## Foreign Key Candidates")
+    if foreign_keys:
+        for fk in foreign_keys:
+            cand_text = ", ".join(
+                f"{c['feed_identifier']}.{c['column']} ({c['similarity']:.2f})"
+                for c in fk.get("candidates", [])
+            )
+            lines.append(f"- `{fk['column']}` → {cand_text}")
+    else:
+        lines.append("- None detected")
+
+    lines.append("")
+    lines.append("## Profile Summary")
+    lines.append("")
+    lines.append(summary_text or "No profile summary generated.")
+    lines.append("")
+
+    er_diagram = _mermaid_er(identifier, columns_schema, foreign_keys)
+    if er_diagram:
+        lines.append("## ER Diagram")
+        lines.append("```mermaid")
+        lines.extend(er_diagram.splitlines())
+        lines.append("```")
+
+    return "\n".join(lines), er_diagram
+
+
+def _mermaid_er(
+    identifier: str, columns_schema: list[dict[str, Any]], foreign_keys: list[dict[str, Any]]
+) -> str:
+    if not columns_schema:
+        return ""
+    lines = ["erDiagram", f"    {identifier} {{"]
+    for col in columns_schema:
+        dtype = str(col.get("dtype", "unknown"))
+        name = str(col.get("name", "column"))
+        pk_flag = " PK" if col.get("is_primary_key_candidate") else ""
+        lines.append(f"        {dtype} {name}{pk_flag}")
+    lines.append("    }")
+    for fk in foreign_keys:
+        column_name = str(fk.get("column", ""))
+        for candidate in fk.get("candidates", []) or []:
+            target_feed = candidate.get("feed_identifier")
+            if not target_feed:
+                continue
+            rel = f'    {identifier} ||--o{{ {target_feed} : "{column_name}"'
+            lines.append(rel)
+    return "\n".join(lines)
+
+
+def _persist_schema_to_redis(
+    identifier: str, version: int, payload: dict[str, Any], markdown: str
+) -> None:
+    key = f"dawn:feed:{identifier}:v{version}"
+    redis_sync.hset(
+        key,
+        mapping={
+            "summary_markdown": markdown,
+            "summary_json": json.dumps(payload),
+        },
+    )
+
+
+def _chunk_summary(identifier: str, version: int, markdown: str) -> None:
+    chunks: list[Chunk] = []
+    source = f"feed:{identifier}:v{version}"
+    for piece in simple_chunker(markdown, max_chars=900, overlap=120):
+        chunks.append(Chunk(text=piece, source=source, row_index=-1, chunk_type="schema"))
+    if chunks:
+        upsert_chunks(chunks)
+
+
+def _build_manifest(
+    *,
+    identifier: str,
+    name: str,
+    owner: str | None,
+    source_kind: str,
+    data_format: str,
+    columns_schema: list[dict[str, Any]],
+    primary_keys: list[str],
+    foreign_keys: list[dict[str, Any]],
+) -> dict[str, Any]:
+    manifest_columns: list[dict[str, Any]] = []
+    for column in columns_schema:
+        manifest_columns.append(
+            {
+                "name": column.get("name"),
+                "dtype": column.get("dtype"),
+                "primary_key": column.get("name") in primary_keys,
+                "null_percent": column.get("null_percent"),
+                "unique_percent": column.get("unique_percent"),
+                "sample_values": (column.get("sample_values") or [])[:3],
+            }
+        )
+
+    foreign_key_map: list[dict[str, Any]] = []
+    for fk in foreign_keys:
+        candidates = fk.get("candidates") or []
+        top = candidates[0] if candidates else {}
+        foreign_key_map.append(
+            {
+                "column": fk.get("column"),
+                "target_feed": top.get("feed_identifier"),
+                "target_column": top.get("column"),
+            }
+        )
+
+    return {
+        "feed": {
+            "identifier": identifier,
+            "name": name,
+            "owner": owner,
+            "source_type": source_kind,
+            "format": data_format,
+        },
+        "columns": manifest_columns,
+        "primary_keys": primary_keys,
+        "foreign_keys": foreign_key_map,
+    }
+
+
+def _compute_drift(
+    current_schema: dict[str, Any],
+    current_profile: dict[str, Any],
+    previous_version: FeedVersion | None,
+) -> dict[str, Any]:
+    if previous_version is None:
+        return {"status": "baseline", "message": "First version ingested."}
+
+    prev_schema = previous_version.schema_ or {}
+    prev_columns = {col["name"]: col for col in prev_schema.get("columns", []) if col.get("name")}
+    curr_columns = {
+        col["name"]: col for col in current_schema.get("columns", []) if col.get("name")
+    }
+
+    added = sorted(set(curr_columns) - set(prev_columns))
+    removed = sorted(set(prev_columns) - set(curr_columns))
+
+    changed_types: list[dict[str, Any]] = []
+    changed_nulls: list[dict[str, Any]] = []
+    for name in sorted(set(curr_columns) & set(prev_columns)):
+        prev_col = prev_columns[name]
+        curr_col = curr_columns[name]
+        if str(prev_col.get("dtype")) != str(curr_col.get("dtype")):
+            changed_types.append(
+                {
+                    "column": name,
+                    "previous": prev_col.get("dtype"),
+                    "current": curr_col.get("dtype"),
+                }
+            )
+        try:
+            prev_null = float(prev_col.get("null_percent", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            prev_null = 0.0
+        try:
+            curr_null = float(curr_col.get("null_percent", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            curr_null = 0.0
+        delta = curr_null - prev_null
+        if abs(delta) >= 5.0:
+            changed_nulls.append(
+                {
+                    "column": name,
+                    "previous_null_percent": round(prev_null, 3),
+                    "current_null_percent": round(curr_null, 3),
+                    "delta": round(delta, 3),
+                }
+            )
+
+    prev_rows = previous_version.row_count or 0
+    curr_rows = current_profile.get("row_count") or 0
+    if not curr_rows:
+        curr_rows = prev_rows
+    row_delta = curr_rows - prev_rows
+
+    status = "no_change"
+    if added or removed or changed_types or changed_nulls or row_delta != 0:
+        status = "changed"
+
+    return {
+        "status": status,
+        "rows": {
+            "previous": prev_rows,
+            "current": curr_rows,
+            "delta": row_delta,
+        },
+        "columns": {
+            "added": added,
+            "removed": removed,
+            "type_changes": changed_types,
+            "null_ratio_changes": changed_nulls,
+        },
+        "previous_version": previous_version.version,
+    }
+
+
+def ingest_feed(
+    *,
+    identifier: str,
+    name: str,
+    source_kind: str,
+    data_format: str | None,
+    owner: str | None,
+    file_bytes: bytes | None,
+    filename: str | None,
+    sheet: str | None,
+    s3_path: str | None,
+    http_url: str | None,
+) -> dict[str, Any]:
+    kind = _ensure_kind(source_kind)
+    inferred_format = _infer_format(filename, data_format)
+    if inferred_format not in DATA_FORMATS:
+        raise FeedIngestError(
+            f"Unsupported data_format {data_format!r}. Expected one of {sorted(DATA_FORMATS)}."
+        )
+
+    raw_bytes: bytes
+    if kind == "upload":
+        if not file_bytes:
+            raise FeedIngestError("file upload required for source_type='upload'.")
+        raw_bytes = file_bytes
+    elif kind == "s3":
+        raw_bytes = _fetch_s3_bytes(s3_path)
+    else:  # http
+        raw_bytes = _fetch_http_bytes(http_url)
+
+    if inferred_format == "excel":
+        df = _load_excel(raw_bytes, sheet)
+    elif inferred_format == "csv":
+        df = _load_csv(raw_bytes)
+    else:
+        raise FeedIngestError(f"Unsupported format {inferred_format!r}.")
+
+    if df.empty:
+        raise FeedIngestError("The ingested dataframe is empty.")
+
+    # profile
+    row_count = int(len(df))
+    sample_df = df.copy()
+    if len(sample_df) > 50000:
+        sample_df = sample_df.sample(n=50000, random_state=42)
+
+    columns_schema, primary_keys = _columns_schema(sample_df)
+    col_count = int(len(sample_df.columns))
+    existing_columns = _collect_existing_columns(identifier)
+    foreign_keys = _infer_foreign_keys(columns_schema, existing_columns, identifier)
+
+    summary_text, column_summaries, metrics, extras = summarize_dataframe(sample_df)
+    profile_payload = {
+        "summary_text": summary_text,
+        "columns": _column_summaries_to_dict(column_summaries),
+        "metrics": _metrics_to_dict(metrics),
+        "extras": extras,
+        "row_count": row_count,
+        "column_count": col_count,
+    }
+
+    schema_payload = {
+        "columns": columns_schema,
+        "primary_keys": primary_keys,
+        "foreign_keys": foreign_keys,
+    }
+
+    relationships_raw = extras.get("relationships") if isinstance(extras, dict) else None
+    relationships_map: dict[str, Any] = {}
+    if isinstance(relationships_raw, dict):
+        relationships_map = dict({str(k): v for k, v in relationships_raw.items()})
+    for fk in foreign_keys:
+        if fk.get("candidates"):
+            relationships_map[fk["column"]] = fk["candidates"][0]["feed_identifier"]
+
+    summary_payload = {
+        "text": summary_text,
+        "columns": profile_payload["columns"],
+        "metrics": profile_payload["metrics"],
+        "insights": extras.get("counts", {}),
+        "aggregates": extras.get("aggregates", []),
+        "relationships": relationships_map,
+        "foreign_keys": foreign_keys,
+        "analysis_plan": extras.get("plan", []),
+        "row_count": row_count,
+        "column_count": col_count,
+    }
+
+    manifest = _build_manifest(
+        identifier=identifier,
+        name=name,
+        owner=owner,
+        source_kind=kind,
+        data_format=inferred_format,
+        columns_schema=columns_schema,
+        primary_keys=primary_keys,
+        foreign_keys=foreign_keys,
+    )
+    summary_payload["manifest"] = manifest
+
+    digest = sha256(raw_bytes).hexdigest()[:16]
+
+    with session_scope() as s:
+        feed = s.execute(select(Feed).where(Feed.identifier == identifier)).scalars().first()
+        if feed is None:
+            feed = Feed(
+                identifier=identifier,
+                name=name,
+                source_type=kind,
+                owner=owner,
+                source_config={
+                    "format": inferred_format,
+                    "sheet": sheet,
+                    "s3_path": s3_path,
+                    "http_url": http_url,
+                },
+            )
+            s.add(feed)
+            s.flush()
+        else:
+            feed.name = name
+            feed.owner = owner
+            cfg = dict(feed.source_config or {})
+            cfg.update(
+                {
+                    "format": inferred_format,
+                    "sheet": sheet,
+                    "s3_path": s3_path,
+                    "http_url": http_url,
+                }
+            )
+            feed.source_type = kind
+            feed.source_config = cfg
+
+        latest_version = (
+            s.execute(
+                select(FeedVersion)
+                .where(FeedVersion.feed_id == feed.id)
+                .order_by(FeedVersion.version.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+
+        previous_version = latest_version
+
+        if latest_version and latest_version.sha16 == digest:
+            feed_version = latest_version
+            version_number = feed_version.version
+            drift_payload = {"status": "no_change", "message": "No differences detected"}
+        else:
+            next_version = (
+                s.execute(
+                    select(func.max(FeedVersion.version)).where(FeedVersion.feed_id == feed.id)
+                ).scalar()
+                or 0
+            )
+            version_number = int(next_version) + 1
+            feed_version = FeedVersion(
+                feed_id=feed.id,
+                version=version_number,
+                sha16=digest,
+                schema_=schema_payload,
+                profile=profile_payload,
+                summary_markdown="",  # set later
+                summary_json=summary_payload,
+                row_count=row_count,
+                column_count=col_count,
+            )
+            s.add(feed_version)
+            drift_payload = _compute_drift(schema_payload, profile_payload, previous_version)
+
+        summary_payload["drift"] = drift_payload
+
+        markdown_doc, er_diagram = _markdown_summary(
+            identifier=identifier,
+            name=name,
+            owner=owner,
+            source_kind=kind,
+            data_format=inferred_format,
+            rows=row_count,
+            cols=col_count,
+            columns_schema=columns_schema,
+            primary_keys=primary_keys,
+            foreign_keys=foreign_keys,
+            summary_text=summary_text,
+        )
+
+        feed_version.schema_ = schema_payload
+        feed_version.profile = profile_payload
+        feed_version.summary_markdown = markdown_doc
+        feed_version.summary_json = summary_payload
+        feed_version.row_count = row_count
+        feed_version.column_count = col_count
+        feed_version.sha16 = digest
+
+        if er_diagram:
+            summary_payload["mermaid"] = er_diagram
+
+        s.flush()
+        sync_auto_rules(session=s, feed_version=feed_version, schema_payload=schema_payload)
+
+    # Persist summary to Redis & RAG
+    try:
+        _persist_schema_to_redis(identifier, version_number, summary_payload, markdown_doc)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[feed-ingest] redis persist failed: {exc}")
+    try:
+        _chunk_summary(identifier, version_number, markdown_doc)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[feed-ingest] chunk embedding failed: {exc}")
+
+    return {
+        "feed": {
+            "identifier": identifier,
+            "name": name,
+            "owner": owner,
+            "source_type": kind,
+            "format": inferred_format,
+        },
+        "version": {
+            "number": version_number,
+            "sha16": digest,
+            "rows": row_count,
+            "columns": col_count,
+        },
+        "schema": schema_payload,
+        "profile": profile_payload,
+        "summary": {
+            "markdown": markdown_doc,
+            "json": summary_payload,
+        },
+        "manifest": manifest,
+        "drift": drift_payload,
+    }

@@ -33,7 +33,9 @@ def test_preview_recent_cached_flow():
     data = r.json()
     assert data["sheet"] == "Sheet1"
     assert data["shape"] == [3, 2]
+    assert data["cached"] is False
     assert "sha16" in data
+    assert data["sheet_names"] == ["Sheet1"]
     sha16 = data["sha16"]
 
     # 2) /ingest/recent
@@ -48,3 +50,56 @@ def test_preview_recent_cached_flow():
     cached = r3.json()
     assert cached["name"] == "Sheet1"
     assert tuple(cached["shape"]) == (3, 2)
+    assert cached["cached"] is True
+    assert cached["sheet_names"] == ["Sheet1"]
+
+
+def test_preview_cache_roundtrip_flag():
+    from app.api.server import app
+
+    client = TestClient(app)
+
+    content = _xlsx_bytes()
+    files = {
+        "file": (
+            "test.xlsx",
+            content,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    }
+    first = client.post("/ingest/preview", files=files)
+    assert first.status_code == 200
+    assert first.json()["cached"] is False
+    assert first.json()["sheet_names"] == ["Sheet1"]
+
+    second = client.post("/ingest/preview", files=files)
+    assert second.status_code == 200
+    assert second.json()["cached"] is True
+    assert second.json()["sheet_names"] == ["Sheet1"]
+
+
+def test_delete_all_cached_previews_clears_state():
+    from app.api.server import app
+
+    client = TestClient(app)
+
+    content = _xlsx_bytes()
+    files = {
+        "file": (
+            "test.xlsx",
+            content,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    }
+    created = client.post("/ingest/preview", files=files)
+    assert created.status_code == 200
+    sha16 = created.json()["sha16"]
+
+    resp = client.delete("/ingest/preview_cached/all")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["cache_removed"] >= 1
+    assert payload["deleted_records"] >= 1
+
+    missing = client.get("/ingest/preview_cached", params={"sha16": sha16})
+    assert missing.status_code == 404

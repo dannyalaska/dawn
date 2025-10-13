@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     # Infra
     REDIS_URL: str = "redis://127.0.0.1:6379/0"
     POSTGRES_DSN: str | None = None  # e.g. postgresql+psycopg2://user:pass@host/db?sslmode=require
+    AWS_REGION: str | None = None
+    AWS_ACCESS_KEY_ID: str | None = None
+    AWS_SECRET_ACCESS_KEY: str | None = None
+    S3_BUCKET: str | None = None
+    S3_ENDPOINT_URL: str | None = None
 
     # LLM knobs (safe defaults; can be overridden via .env)
     LLM_PROVIDER: str = "stub"  # stub | ollama | openai

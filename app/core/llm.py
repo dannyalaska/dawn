@@ -106,7 +106,8 @@ def _answer_openai(question: str, context: str, hits: list[dict]) -> str:
             ],
             temperature=0.1,
         )
-        return resp.choices[0].message.content.strip()
+        content = resp.choices[0].message.content
+        return content.strip() if isinstance(content, str) and content else "No answer."
     except Exception as e:
         return f"(openai error: {e})\n\nFallback context:\n{context}"
 

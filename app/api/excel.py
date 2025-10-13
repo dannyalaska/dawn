@@ -4,7 +4,7 @@ from hashlib import sha256
 from typing import Any
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 
 from app.core.db import session_scope
 from app.core.excel.ingestion import preview_from_bytes
@@ -55,8 +55,9 @@ async def preview(sheet: str | None = Query(default=None), file: UploadFile = fi
         "shape": table.shape,
         "columns": table.columns,
         "rows": table.rows,
-        "cached": True,
+        "cached": table.cached,
         "sha16": digest,
+        "sheet_names": table.sheet_names or [],
     }
 
 
@@ -98,4 +99,34 @@ def preview_cached(sha16: str, sheet: str | None = None) -> dict[str, Any]:
         raise HTTPException(404, f"No cached preview for digest={sha16} sheet={sheet!r}")
     import json
 
-    return json.loads(cached)
+    data = json.loads(cached)
+    data["cached"] = True
+    return data
+
+
+@router.delete("/preview_cached")
+def delete_preview_cached(sha16: str, sheet: str | None = None) -> dict[str, Any]:
+    key = _preview_cache_key(sha16, sheet)
+    removed = bool(redis_sync.delete(key))
+    with session_scope() as s:
+        stmt = select(Upload).where(Upload.sha16 == sha16)
+        if sheet:
+            stmt = stmt.where(Upload.sheet == sheet)
+        rows = s.execute(stmt).scalars().all()
+        deleted_rows = 0
+        for row in rows:
+            s.delete(row)
+            deleted_rows += 1
+    return {"ok": True, "cache_removed": removed, "deleted_records": deleted_rows}
+
+
+@router.delete("/preview_cached/all")
+def delete_all_cached_previews() -> dict[str, Any]:
+    removed = 0
+    keys = list(redis_sync.scan_iter(match="dawn:dev:preview:*"))
+    if keys:
+        removed = redis_sync.delete(*keys)
+    with session_scope() as s:
+        result = s.execute(delete(Upload))
+        deleted_rows = result.rowcount or 0
+    return {"ok": True, "cache_removed": removed, "deleted_records": deleted_rows}

@@ -13,7 +13,9 @@ import requests
 import streamlit as st
 from components import (
     render_context_editor,
+    render_feed_wizard,
     render_header,
+    render_nl_filter_lab,
     render_query_workspace,
     render_rag_diagnostics,
     render_sidebar,
@@ -421,6 +423,75 @@ def _fetch_rag_ping() -> dict[str, Any]:
         return resp.json()
     except Exception:
         return {"index_ready": False}
+
+
+def _fetch_jobs() -> list[dict[str, Any]]:
+    try:
+        resp = requests.get(f"{API_BASE}/jobs", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict):
+            jobs = data.get("jobs")
+            if isinstance(jobs, list):
+                return jobs
+        if isinstance(data, list):
+            return data
+    except Exception:
+        return []
+    return []
+
+
+def _run_job_now(job_id: int) -> dict[str, Any] | None:
+    try:
+        resp = requests.post(f"{API_BASE}/jobs/{job_id}/run", timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Job run failed: {exc}")
+        return None
+
+
+def _render_jobs_panel(jobs: list[dict[str, Any]]) -> None:
+    st.markdown("### Jobs & Pipelines")
+    if not jobs:
+        st.info("No jobs configured yet. Create a transform to enable automated runs.")
+        return
+    for job in jobs:
+        job_id = job.get("id")
+        name = job.get("name", "Job")
+        feed_label = job.get("feed") or "—"
+        feed_version = job.get("feed_version") or "—"
+        transform_version = job.get("transform_version") or "—"
+        with st.container():
+            header_col, action_col = st.columns([3, 1])
+            with header_col:
+                st.markdown(f"**{name}**")
+                st.caption(f"Feed: {feed_label} v{feed_version} • Transform v{transform_version}")
+            with action_col:
+                disabled = job_id is None
+                if st.button("Run now", key=f"run_job_{job_id}", disabled=disabled):
+                    result = _run_job_now(int(job_id)) if job_id is not None else None
+                    if result:
+                        status = str(result.get("run", {}).get("status", "unknown"))
+                        icon = "✅" if status == "success" else "⚠️"
+                        st.toast(f"{name} run {status}", icon=icon)
+                        st.session_state["dawn_jobs_refresh_token"] = time.time()
+                        st.rerun()
+
+            last_run = job.get("last_run") or {}
+            metrics_cols = st.columns(4)
+            metrics_cols[0].metric("Last status", last_run.get("status", "—"))
+            metrics_cols[1].metric("Rows in", last_run.get("rows_in", "—"))
+            metrics_cols[2].metric("Rows out", last_run.get("rows_out", "—"))
+            metrics_cols[3].metric("Finished", last_run.get("finished_at", "—"))
+
+            warnings = last_run.get("warnings") or []
+            if warnings:
+                st.caption("Warnings")
+                for warning in warnings:
+                    st.code(str(warning))
+            st.divider()
 
 
 def _build_rag_diagnostics(
@@ -887,12 +958,32 @@ def main() -> None:
         st.session_state["dawn_chunk_overlap"] = new_overlap
         st.session_state["dawn_rag_top_k"] = int(chunk_settings.get("top_k", 6))
 
-    col_main_area, col_chat_panel = st.columns([3.7, 1.3], gap="large", vertical_alignment="top")
+    query_events = {
+        "prompt": "",
+        "submitted": False,
+        "as_note": False,
+        "regenerate": False,
+        "copy_answer": False,
+    }
 
-    with col_main_area:
-        workspace_tab, context_tab = st.tabs(["Workspace", "Context"])
+    mode_options = ["Quick Insight", "Datafeed Studio", "Context"]
+    current_mode = st.session_state.get("workspace_mode", mode_options[0])
+    mode = st.radio(
+        "Pick a workspace",
+        mode_options,
+        index=mode_options.index(current_mode) if current_mode in mode_options else 0,
+        horizontal=True,
+    )
+    st.session_state["workspace_mode"] = mode
 
-        with workspace_tab:
+    if mode == "Quick Insight":
+        seed = st.session_state.pop("quick_insight_seed", None)
+        if seed:
+            _handle_replay(seed)
+
+        quick_main, quick_chat = st.columns([3.7, 1.3], gap="large", vertical_alignment="top")
+
+        with quick_main:
             upload_events = render_upload_area(
                 preview_data=st.session_state.get("dawn_preview_data"),
                 preview_summary=st.session_state.get("dawn_preview_summary"),
@@ -907,120 +998,135 @@ def main() -> None:
             )
             _process_upload_events(upload_events)
 
+            if st.session_state.get("dawn_preview_upload") and st.button(
+                "Promote this file to Datafeed Studio", key="promote_to_feed"
+            ):
+                st.session_state["feed_wizard_prefill"] = st.session_state.get(
+                    "dawn_preview_upload"
+                )
+                st.session_state["workspace_mode"] = "Datafeed Studio"
+                st.rerun()
             st.divider()
             render_rag_diagnostics(diagnostics=diagnostics)
 
-        with context_tab:
-            st.markdown("### Context Memory")
-            st.caption(
-                "Curate the knowledge base that Dawn uses when answering questions. Update existing chunks or add clarifying notes whenever the data needs an extra hint."
-            )
-            context_source = _current_context_source()
-            context_entries = _fetch_context_chunks(context_source)
-            context_events = render_context_editor(source=context_source, entries=context_entries)
-            _process_context_events(context_events)
+            preview_rows = st.session_state.get("dawn_preview_data", {}).get("rows")
+            if isinstance(preview_rows, list) and preview_rows:
+                preview_df = pd.DataFrame(preview_rows)
+                if not preview_df.empty:
+                    render_nl_filter_lab({"current_preview": preview_df}, key_prefix="workspace")
 
-            current_sha = st.session_state.get("dawn_current_sha")
-            current_sheet = st.session_state.get("dawn_selected_sheet")
-            if not current_sheet and context_source and ":" in context_source:
-                current_sheet = context_source.split(":", 1)[1]
+        with quick_chat:
+            chat_open = st.session_state.get("dawn_chat_open", True)
+            toggle_label = "Hide Chat" if chat_open else "Show Chat"
+            st.markdown('<div class="dawn-chat-toggle-wrap">', unsafe_allow_html=True)
+            if st.button(toggle_label, key="dawn_chat_toggle"):
+                chat_open = not chat_open
+                st.session_state["dawn_chat_open"] = chat_open
+            st.markdown("</div>", unsafe_allow_html=True)
 
-            if current_sha and current_sheet:
-                memory_snapshot = _fetch_memory_snapshot(current_sha, current_sheet)
-
-                st.markdown("#### Column roles")
-                relationships = memory_snapshot.get("relationships", {}) or {}
-                rel_df = pd.DataFrame(
-                    [{"column": col, "role": role} for col, role in relationships.items()]
-                )
-                if rel_df.empty:
-                    rel_df = pd.DataFrame({"column": [], "role": []})
-                edited_rel_df = st.data_editor(
-                    rel_df,
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    key="dawn_relationship_editor",
-                )
-                if st.button("Save column roles", key="dawn_save_relationships"):
-                    rel_records = edited_rel_df.to_dict(orient="records")
-                    cleaned_relationships = {
-                        str(row["column"]).strip(): str(row["role"]).strip()
-                        for row in rel_records
-                        if row.get("column") and row.get("role")
-                    }
-                    if _update_memory_snapshot(
-                        current_sha,
-                        current_sheet,
-                        relationships=cleaned_relationships,
-                    ):
-                        st.success("Column roles saved.")
-                        st.rerun()
-
-                st.markdown("#### Analysis plan")
-                plan = memory_snapshot.get("analysis_plan") or []
-                if plan:
-                    plan_df = pd.DataFrame(plan)
-                else:
-                    st.info("No analysis plan defined yet. Add or edit rows below to guide Dawn.")
-                    plan_df = pd.DataFrame(
-                        [{"type": "", "column": "", "group": "", "value": "", "stat": ""}]
+            if chat_open:
+                with styled_block("dawn-chat-panel"):
+                    if st.session_state.pop("dawn_query_reset", False):
+                        st.session_state["dawn_query_draft"] = ""
+                    query_events = render_query_workspace(
+                        history=st.session_state.get("dawn_query_history"),
+                        current_answer=st.session_state.get("dawn_current_answer"),
+                        context_chunks=st.session_state.get("dawn_context_chunks"),
                     )
-                edited_plan_df = st.data_editor(
-                    plan_df,
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    key="dawn_plan_editor",
-                )
-                if st.button("Save plan", key="dawn_save_plan"):
-                    plan_records = [
-                        {k: v for k, v in row.items() if v not in (None, "")}
-                        for row in edited_plan_df.to_dict(orient="records")
-                        if any(row.values())
-                    ]
-                    if _update_memory_snapshot(current_sha, current_sheet, plan=plan_records):
-                        st.success("Analysis plan saved.")
-                        st.rerun()
-
-                insights = memory_snapshot.get("insights") or {}
-                if insights:
-                    st.markdown("#### Insight snapshots")
-                    st.json(insights)
-
-                aggregates = memory_snapshot.get("aggregates") or []
-                if aggregates:
-                    st.markdown("#### Aggregate highlights")
-                    agg_df = pd.DataFrame(aggregates)
-                    st.dataframe(agg_df, use_container_width=True)
             else:
-                st.info("Preview or index a worksheet to curate metadata.")
+                st.caption("Chat panel hidden. Use the toggle above to reopen.")
 
-    query_events = {
-        "prompt": "",
-        "submitted": False,
-        "as_note": False,
-        "regenerate": False,
-        "copy_answer": False,
-    }
-    with col_chat_panel:
-        chat_open = st.session_state.get("dawn_chat_open", True)
-        toggle_label = "Hide Chat" if chat_open else "Show Chat"
-        st.markdown('<div class="dawn-chat-toggle-wrap">', unsafe_allow_html=True)
-        if st.button(toggle_label, key="dawn_chat_toggle"):
-            chat_open = not chat_open
-            st.session_state["dawn_chat_open"] = chat_open
-        st.markdown("</div>", unsafe_allow_html=True)
+    elif mode == "Datafeed Studio":
+        st.session_state.pop("quick_insight_seed", None)
+        render_feed_wizard(API_BASE)
+        st.divider()
+        jobs = _fetch_jobs()
+        _render_jobs_panel(jobs)
 
-        if chat_open:
-            with styled_block("dawn-chat-panel"):
-                if st.session_state.pop("dawn_query_reset", False):
-                    st.session_state["dawn_query_draft"] = ""
-                query_events = render_query_workspace(
-                    history=st.session_state.get("dawn_query_history"),
-                    current_answer=st.session_state.get("dawn_current_answer"),
-                    context_chunks=st.session_state.get("dawn_context_chunks"),
+    else:  # Context
+        st.session_state.pop("quick_insight_seed", None)
+        st.markdown("### Context Memory")
+        st.caption(
+            "Curate the knowledge base that Dawn uses when answering questions. Update existing chunks or add clarifying notes whenever the data needs an extra hint."
+        )
+        context_source = _current_context_source()
+        context_entries = _fetch_context_chunks(context_source)
+        context_events = render_context_editor(source=context_source, entries=context_entries)
+        _process_context_events(context_events)
+
+        current_sha = st.session_state.get("dawn_current_sha")
+        current_sheet = st.session_state.get("dawn_selected_sheet")
+        if not current_sheet and context_source and ":" in context_source:
+            current_sheet = context_source.split(":", 1)[1]
+
+        if current_sha and current_sheet:
+            memory_snapshot = _fetch_memory_snapshot(current_sha, current_sheet)
+
+            st.markdown("#### Column roles")
+            relationships = memory_snapshot.get("relationships", {}) or {}
+            rel_df = pd.DataFrame(
+                [{"column": col, "role": role} for col, role in relationships.items()]
+            )
+            if rel_df.empty:
+                rel_df = pd.DataFrame({"column": [], "role": []})
+            edited_rel_df = st.data_editor(
+                rel_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="dawn_relationship_editor",
+            )
+            if st.button("Save column roles", key="dawn_save_relationships"):
+                rel_records = edited_rel_df.to_dict(orient="records")
+                cleaned_relationships = {
+                    str(row["column"]).strip(): str(row["role"]).strip()
+                    for row in rel_records
+                    if row.get("column") and row.get("role")
+                }
+                if _update_memory_snapshot(
+                    current_sha,
+                    current_sheet,
+                    relationships=cleaned_relationships,
+                ):
+                    st.success("Column roles saved.")
+                    st.rerun()
+
+            st.markdown("#### Analysis plan")
+            plan = memory_snapshot.get("analysis_plan") or []
+            if plan:
+                plan_df = pd.DataFrame(plan)
+            else:
+                st.info("No analysis plan defined yet. Add or edit rows below to guide Dawn.")
+                plan_df = pd.DataFrame(
+                    [{"type": "", "column": "", "group": "", "value": "", "stat": ""}]
                 )
+            edited_plan_df = st.data_editor(
+                plan_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="dawn_plan_editor",
+            )
+            if st.button("Save plan", key="dawn_save_plan"):
+                plan_records = [
+                    {k: v for k, v in row.items() if v not in (None, "")}
+                    for row in edited_plan_df.to_dict(orient="records")
+                    if any(row.values())
+                ]
+                if _update_memory_snapshot(current_sha, current_sheet, plan=plan_records):
+                    st.success("Analysis plan saved.")
+                    st.rerun()
+
+            insights = memory_snapshot.get("insights") or {}
+            if insights:
+                st.markdown("#### Insight snapshots")
+                st.json(insights)
+
+            aggregates = memory_snapshot.get("aggregates") or []
+            if aggregates:
+                st.markdown("#### Aggregate highlights")
+                agg_df = pd.DataFrame(aggregates)
+                st.dataframe(agg_df, use_container_width=True)
         else:
-            st.caption("Chat panel hidden. Use the toggle above to reopen.")
+            st.info("Preview or index a worksheet to curate metadata.")
 
     _process_query_events(query_events)
 

@@ -21,6 +21,8 @@ class TablePreview:
     columns: list[dict[str, Any]]
     rows: list[dict[str, Any]]
     shape: tuple[int, int]
+    cached: bool = False
+    sheet_names: list[str] | None = None
 
 
 def cache_key(content: bytes, sheet: str | None) -> str:
@@ -87,13 +89,21 @@ def preview_from_bytes(
     cached = redis_sync.get(key)
     if cached:
         obj = json.loads(cached)
+        obj["cached"] = True
         return TablePreview(**obj)
 
     df = xl.parse(name)
 
     rows = _sanitize_rows(df, max_rows=max_rows)
     columns = df_profile(df)
-    table = TablePreview(name=name, columns=columns, rows=rows, shape=(df.shape[0], df.shape[1]))
+    table = TablePreview(
+        name=name,
+        columns=columns,
+        rows=rows,
+        shape=(df.shape[0], df.shape[1]),
+        cached=False,
+        sheet_names=xl.sheet_names,
+    )
 
     # Cache as JSON-safe dict
     redis_sync.setex(key, CACHE_TTL_SECONDS, json.dumps(asdict(table)))

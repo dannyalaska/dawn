@@ -7,6 +7,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+API_PID=""
+OLLAMA_PID=""
+
 if [[ -f ".env" ]]; then
   echo "📦 Loading environment from .env"
   tmp_env="$(mktemp)"
@@ -77,6 +80,42 @@ else
   echo "⚠️  Homebrew not found; make sure Redis and Postgres are running."
 fi
 
+if [[ "${LLM_PROVIDER:-stub}" == "ollama" ]]; then
+  if ! command -v ollama >/dev/null 2>&1; then
+    echo "⚠️  Ollama CLI not found. Install from https://ollama.ai/download to use local models."
+  else
+    export OLLAMA_MODEL="${OLLAMA_MODEL:-llama3}"
+    if ! curl -fsS --max-time 1 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+      echo "🦙 Starting Ollama server..."
+      ollama serve >"${TMPDIR:-/tmp}/dawn_ollama.log" 2>&1 &
+      OLLAMA_PID=$!
+      for _ in {1..20}; do
+        if curl -fsS --max-time 1 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+          echo "✅ Ollama API is up."
+          break
+        fi
+        if ! ps -p "${OLLAMA_PID}" >/dev/null 2>&1; then
+          echo "⚠️  Ollama server exited unexpectedly; check ${TMPDIR:-/tmp}/dawn_ollama.log."
+          OLLAMA_PID=""
+          break
+        fi
+        sleep 0.5
+      done
+    else
+      echo "🦙 Ollama server already running."
+    fi
+
+    echo "📦 Ensuring Ollama model '${OLLAMA_MODEL}' is available..."
+    if ! ollama show "${OLLAMA_MODEL}" >/dev/null 2>&1; then
+      if ollama pull "${OLLAMA_MODEL}"; then
+        echo "✅ Pulled Ollama model '${OLLAMA_MODEL}'."
+      else
+        echo "⚠️  Failed to pull Ollama model '${OLLAMA_MODEL}'. DAWN will continue but responses may fail."
+      fi
+    fi
+  fi
+fi
+
 poetry env use python3.11
 source "$(poetry env info --path)/bin/activate"
 
@@ -94,8 +133,11 @@ cleanup() {
   if [[ -n "${API_PID}" ]] && ps -p "${API_PID}" >/dev/null 2>&1; then
     kill "${API_PID}" || true
   fi
+  if [[ -n "${OLLAMA_PID}" ]] && ps -p "${OLLAMA_PID}" >/dev/null 2>&1; then
+    kill "${OLLAMA_PID}" || true
+  fi
 }
-API_PID=""
+
 trap cleanup EXIT
 
 poetry run uvicorn app.api.server:app --port 8000 --reload &

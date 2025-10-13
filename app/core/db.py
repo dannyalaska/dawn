@@ -64,3 +64,9 @@ def session_scope() -> Generator[Session, None, None]:
         raise
     finally:
         session.close()
+
+
+def init_database() -> None:
+    """Ensure core tables exist before serving requests."""
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)

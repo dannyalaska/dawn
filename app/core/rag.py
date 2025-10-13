@@ -78,6 +78,7 @@ class Chunk:
     text: str
     source: str
     row_index: int
+    chunk_type: str = "excel"
 
 
 def simple_chunker(text: str, *, max_chars: int = 800, overlap: int = 120) -> list[str]:
@@ -110,7 +111,7 @@ def upsert_chunks(chunks: list[Chunk]) -> int:
             mapping={
                 "text": c.text,
                 "source": c.source,
-                "type": "excel",
+                "type": c.chunk_type,
                 "row_index": c.row_index,
                 VEC_FIELD: v.tobytes(),
             },
@@ -153,3 +154,79 @@ def format_context(chunks: list[dict[str, Any]], limit_chars: int = 2500) -> str
         buf.append(s)
         total += len(s)
     return "\n".join(buf)
+
+
+def list_context_chunks(source: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for key in redis_sync.scan_iter(match=f"{PREFIX}*"):
+        text_val, source_val, row_raw, chunk_type = redis_sync.hmget(
+            key, "text", "source", "row_index", "type"
+        )
+        if text_val is None and source_val is None:
+            continue
+        chunk_source = source_val if source_val is not None else None
+        if source and chunk_source != source:
+            continue
+        doc_id = key[len(PREFIX) :]
+        chunk_kind = chunk_type or "excel"
+        try:
+            row_index = int(row_raw) if row_raw is not None else -1
+        except Exception:  # noqa: BLE001
+            row_index = -1
+        chunks.append(
+            {
+                "id": doc_id,
+                "text": text_val or "",
+                "source": chunk_source,
+                "row_index": row_index,
+                "type": chunk_kind,
+            }
+        )
+        if len(chunks) >= limit:
+            break
+    chunks.sort(key=lambda c: (c.get("type") != "note", c.get("row_index", 0), c.get("id", "")))
+    return chunks
+
+
+def update_context_chunk(doc_id: str, new_text: str) -> dict[str, Any]:
+    key = _doc_key(doc_id)
+    source_val, row_raw, chunk_type = redis_sync.hmget(key, "source", "row_index", "type")
+    if source_val is None and row_raw is None and chunk_type is None:
+        msg = f"Chunk {doc_id!r} not found"
+        raise KeyError(msg)
+    vec = embed_texts([new_text])[0].tobytes()
+    redis_sync.hset(
+        key,
+        mapping={
+            "text": new_text,
+            VEC_FIELD: vec,
+        },
+    )
+    try:
+        row_index = int(row_raw) if row_raw is not None else -1
+    except Exception:  # noqa: BLE001
+        row_index = -1
+    return {
+        "id": doc_id,
+        "text": new_text,
+        "source": source_val,
+        "row_index": row_index,
+        "type": chunk_type or "excel",
+    }
+
+
+def add_manual_note(source: str, note: str) -> dict[str, Any]:
+    chunk = Chunk(text=note, source=source, row_index=-1, chunk_type="note")
+    upsert_chunks([chunk])
+    doc_id = hashlib.sha1((chunk.source + chunk.text).encode("utf-8")).hexdigest()[:16]
+    key = _doc_key(doc_id)
+    text_val, source_val, row_val, type_val = redis_sync.hmget(
+        key, "text", "source", "row_index", "type"
+    )
+    return {
+        "id": doc_id,
+        "text": text_val or "",
+        "source": source_val,
+        "row_index": -1,
+        "type": type_val or "note",
+    }
