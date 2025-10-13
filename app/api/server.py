@@ -19,6 +19,7 @@ from app.core.config import settings
 from app.core.db import init_database, session_scope
 from app.core.rag import _ensure_index  # type: ignore[attr-defined]
 from app.core.redis_client import redis_async, redis_sync
+from app.core.scheduler import start_scheduler, stop_scheduler
 
 app = FastAPI(title="DAWN API")
 
@@ -38,6 +39,21 @@ def _startup_tasks() -> None:
     init_database()
     with contextlib.suppress(Exception):
         _ensure_index(redis_sync, 384)
+
+    # Start the background job scheduler
+    try:
+        start_scheduler()
+    except Exception as exc:
+        print(f"[server] Failed to start scheduler: {exc}")
+
+
+@app.on_event("shutdown")
+def _shutdown_tasks() -> None:
+    # Stop the scheduler gracefully
+    try:
+        stop_scheduler()
+    except Exception as exc:
+        print(f"[server] Error stopping scheduler: {exc}")
 
 
 async def _check_redis() -> bool:

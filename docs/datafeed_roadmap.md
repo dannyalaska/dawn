@@ -150,3 +150,12 @@ flowchart LR
 - [x] Persist & display detailed summary cards (schema, PK/FK, drift, DQ).
 - [x] Build DQ rule engine (auto rule persistence + evaluation hook).
 - [ ] Update documentation & UX walkthrough for onboarding flow.
+
+## Sprint 2 — In Progress
+
+### Week 1: Scheduler & Documentation
+- [ ] Polish API and user documentation
+- [ ] Implement job scheduler with background worker (APScheduler)
+- [ ] Add manual job trigger endpoints
+- [ ] Test scheduled execution end-to-end
+- [ ] Update feed wizard to create actual scheduled jobs

@@ -13,6 +13,120 @@ class JobError(Exception):
     """Raised when job operations fail."""
 
 
+def _finalize_job_run(
+    *,
+    job_id: int,
+    run_id: int,
+    status: str,
+    rows_in: int,
+    rows_out: int,
+    validation: dict[str, Any],
+    warnings: list[dict[str, Any]],
+    logs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Update job run record with final status and metrics."""
+    finished = datetime.utcnow()
+    with session_scope() as session:
+        run = session.get(JobRun, run_id)
+        if run is None:
+            raise JobError(f"JobRun id={run_id} disappeared")
+        assert isinstance(run, JobRun)  # for type checker
+        run.status = status
+        run.finished_at = finished
+        run.rows_in = rows_in
+        run.rows_out = rows_out
+        run.warnings = warnings
+        run.validation = validation
+        run.logs = logs
+        run_dict = _job_run_to_dict(run)
+        job = session.get(Job, job_id)
+        if job is None:
+            raise JobError(f"Job id={job_id} not found during finalization")
+        job_dict = _serialize_job(session, job)
+
+    return {
+        "job": job_dict,
+        "run": run_dict,
+    }
+
+
+def execute_job(job_id: int) -> dict[str, Any]:
+    """Execute a job immediately and return the results.
+
+    Args:
+        job_id: Database job ID to execute
+
+    Returns:
+        Dict containing job and run information
+
+    Raises:
+        JobError: If job is not found or execution fails
+    """
+    with session_scope() as session:
+        job = session.get(Job, job_id)
+        if job is None:
+            raise JobError(f"Job id={job_id} not found")
+
+        run = JobRun(
+            job_id=job_id,
+            status="running",
+            started_at=datetime.utcnow(),
+        )
+        session.add(run)
+        session.flush()  # Get run.id
+        run_id = run.id
+
+    try:
+        feed_version = session.get(FeedVersion, job.feed_version_id)
+        transform_version = (  # noqa: F841 (TODO: implement transform execution)
+            session.get(TransformVersion, job.transform_version_id)
+            if job.transform_version_id
+            else None
+        )
+
+        if feed_version is None:
+            raise JobError(
+                f"Feed version id={job.feed_version_id} not found"
+            )  # TODO: Actually process the data here based on feed_version and transform_version
+        # For now, just simulate success
+        status = "success"
+        rows_in = feed_version.row_count or 0
+        rows_out = rows_in
+        validation: dict[str, Any] = {}
+        warnings: list[dict[str, Any]] = []
+        logs: list[dict[str, Any]] = [
+            {
+                "ts": datetime.utcnow().isoformat(),
+                "level": "info",
+                "message": f"Processed {rows_in} rows",
+            }
+        ]
+        return _finalize_job_run(
+            job_id=job_id,
+            run_id=run_id,
+            status=status,
+            rows_in=rows_in,
+            rows_out=rows_out,
+            validation=validation,
+            warnings=warnings,
+            logs=logs,
+        )
+    except Exception as exc:
+        return _finalize_job_run(
+            job_id=job_id,
+            run_id=run_id,
+            status="failed",
+            rows_in=0,
+            rows_out=0,
+            validation={},
+            warnings=[{"type": "error", "message": str(exc)}],
+            logs=[{"ts": datetime.utcnow().isoformat(), "level": "error", "message": str(exc)}],
+        )
+
+
+__all__ = ["JobError", "create_job", "get_job", "list_jobs", "execute_job"]
+
+
 def _resolve_feed_version(session, feed: Feed, version: int | None) -> FeedVersion:
     stmt = select(FeedVersion).where(FeedVersion.feed_id == feed.id)
     if version is not None:
