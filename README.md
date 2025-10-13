@@ -29,11 +29,12 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 | Layer | Responsibility |
 | --- | --- |
 | **Streamlit** | Upload + sheet picker, dataset overview, expandable column & aggregate panels, context editor, chat workspace. |
-| **FastAPI** | `/ingest/preview`, `/rag/index_excel`, `/rag/context`, `/rag/memory`, `/rag/chat`, etc. |
+| **FastAPI** | `/ingest/preview`, `/rag/index_excel`, `/rag/context`, `/rag/memory`, `/rag/chat`, `/jobs`, etc. |
 | **pandas** | Profiling, counts, numeric stats, aggregation execution. |
-| **LLM** | Generates analysis plan + assists with narrative answers when metrics aren’t enough. |
+| **APScheduler** | Background job scheduling and execution for automated data processing. |
+| **LLM** | Generates analysis plan + assists with narrative answers when metrics aren't enough. |
 | **Redis** | Vector store for chunks, JSON hashes for plan/relationships/notes. |
-| **Postgres** | Durable storage for uploads and summary JSON (metrics, plan, relationships). |
+| **Postgres** | Durable storage for uploads, jobs, and summary JSON (metrics, plan, relationships). |
 
 ---
 
@@ -79,8 +80,8 @@ Pre-commit is configured (`poetry run pre-commit run --all-files`).
 ---
 
 ## Roadmap snapshots
-- **Campus (now)** – Excel intelligence with editable memory, deterministic answers, and semantic context.
-- **Next** – Assisted workbook editing (approve patches), SQL ingestion, multi-workbook memory, and scheduled runs.
+- **Campus (now)** – Excel intelligence with editable memory, deterministic answers, semantic context, and automated job scheduling.
+- **Next** – Assisted workbook editing (approve patches), SQL ingestion, and multi-workbook memory.
 
 ---
 
