@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from datetime import date, datetime
 from difflib import SequenceMatcher
 from hashlib import sha256
 from io import BytesIO
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import requests
 from sqlalchemy import func, select
@@ -49,14 +51,14 @@ def _ensure_kind(kind: str) -> str:
     return k
 
 
-def _load_excel(content: bytes, sheet: str | None) -> pd.DataFrame:
+def _load_excel(content: bytes, sheet: str | None) -> tuple[pd.DataFrame, str, list[str]]:
     xl = pd.ExcelFile(BytesIO(content))
     target_sheet = sheet or xl.sheet_names[0]
     if target_sheet not in xl.sheet_names:
         raise FeedIngestError(
             f"Sheet {target_sheet!r} not found. Available sheets: {', '.join(xl.sheet_names)}."
         )
-    return xl.parse(target_sheet)
+    return xl.parse(target_sheet), target_sheet, list(xl.sheet_names)
 
 
 def _load_csv(content: bytes) -> pd.DataFrame:
@@ -193,6 +195,45 @@ def _columns_schema(df: pd.DataFrame) -> tuple[list[dict[str, Any]], list[str]]:
         columns.append(column_info)
 
     return columns, primary_candidates
+
+
+def _normalize_scalar(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, pd.Timestamp | datetime | date):
+        return value.isoformat()
+    if isinstance(value, pd.Timedelta):
+        return str(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, bytes | bytearray):
+        return value.decode("utf-8", errors="ignore")
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            pass
+    return value
+
+
+def _serialize_rows(df: pd.DataFrame, *, limit: int = 50) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if df.empty:
+        return rows
+    for record in df.head(limit).to_dict(orient="records"):
+        normalized = {str(col): _normalize_scalar(val) for col, val in record.items()}
+        rows.append(normalized)
+    return rows
 
 
 def _column_summaries_to_dict(summaries: Iterable[ColumnSummary]) -> list[dict[str, Any]]:
@@ -344,6 +385,7 @@ def _build_manifest(
     owner: str | None,
     source_kind: str,
     data_format: str,
+    sheet: str | None,
     columns_schema: list[dict[str, Any]],
     primary_keys: list[str],
     foreign_keys: list[dict[str, Any]],
@@ -380,6 +422,7 @@ def _build_manifest(
             "owner": owner,
             "source_type": source_kind,
             "format": data_format,
+            "sheet": sheet,
         },
         "columns": manifest_columns,
         "primary_keys": primary_keys,
@@ -493,8 +536,11 @@ def ingest_feed(
     else:  # http
         raw_bytes = _fetch_http_bytes(http_url)
 
+    resolved_sheet: str | None = None
+    sheet_names: list[str] = []
+
     if inferred_format == "excel":
-        df = _load_excel(raw_bytes, sheet)
+        df, resolved_sheet, sheet_names = _load_excel(raw_bytes, sheet)
     elif inferred_format == "csv":
         df = _load_csv(raw_bytes)
     else:
@@ -508,6 +554,8 @@ def ingest_feed(
     sample_df = df.copy()
     if len(sample_df) > 50000:
         sample_df = sample_df.sample(n=50000, random_state=42)
+
+    sample_rows = _serialize_rows(df, limit=50)
 
     columns_schema, primary_keys = _columns_schema(sample_df)
     col_count = int(len(sample_df.columns))
@@ -523,11 +571,15 @@ def ingest_feed(
         "row_count": row_count,
         "column_count": col_count,
     }
+    profile_payload["sheet"] = resolved_sheet
+    profile_payload["sheet_names"] = sheet_names
+    profile_payload["sample_rows"] = sample_rows
 
     schema_payload = {
         "columns": columns_schema,
         "primary_keys": primary_keys,
         "foreign_keys": foreign_keys,
+        "sheet": resolved_sheet,
     }
 
     relationships_raw = extras.get("relationships") if isinstance(extras, dict) else None
@@ -549,6 +601,9 @@ def ingest_feed(
         "analysis_plan": extras.get("plan", []),
         "row_count": row_count,
         "column_count": col_count,
+        "sheet": resolved_sheet,
+        "sheet_names": sheet_names,
+        "sample_rows": sample_rows,
     }
 
     manifest = _build_manifest(
@@ -557,6 +612,7 @@ def ingest_feed(
         owner=owner,
         source_kind=kind,
         data_format=inferred_format,
+        sheet=resolved_sheet,
         columns_schema=columns_schema,
         primary_keys=primary_keys,
         foreign_keys=foreign_keys,

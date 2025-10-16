@@ -102,16 +102,16 @@ def _render_stepper(steps: list[str], current_step: int) -> None:
 
 
 def _render_manifest_preview(manifest: dict[str, Any]) -> None:
-    st.markdown("#### Manifest preview")
-    st.json(manifest)
-    download = json.dumps(manifest, indent=2).encode("utf-8")
-    st.download_button(
-        label="Download manifest.json",
-        data=download,
-        file_name=f"{manifest['feed']['identifier']}_manifest.json",
-        mime="application/json",
-        key="feed_wizard_manifest_download",
-    )
+    with st.expander("Manifest preview", expanded=False):
+        st.json(manifest)
+        download = json.dumps(manifest, indent=2).encode("utf-8")
+        st.download_button(
+            label="Download manifest.json",
+            data=download,
+            file_name=f"{manifest['feed']['identifier']}_manifest.json",
+            mime="application/json",
+            key="feed_wizard_manifest_download",
+        )
 
 
 def _render_drift_summary(results: list[dict[str, Any]]) -> None:
@@ -140,33 +140,6 @@ def _render_drift_summary(results: list[dict[str, Any]]) -> None:
             st.write(
                 f"  • `{change['column']}` Δ {change['delta']:.2f}% (now {change['current_null_percent']:.2f}%)"
             )
-
-
-def _render_schedule_section() -> None:
-    st.markdown("### Schedule & automation preferences")
-    st.caption(
-        "Configure when DAWN should expect new files. We'll use this in Sprint 2 to auto-create jobs."
-    )
-    freq = st.selectbox(
-        "Refresh cadence",
-        ["Manual only", "Daily", "Weekly", "Monthly"],
-        key="feed_wizard_schedule_freq",
-    )
-    time = st.time_input("Preferred run time", key="feed_wizard_schedule_time")
-    notify = st.multiselect(
-        "Notify via",
-        ["Email", "Slack"],
-        key="feed_wizard_schedule_notify",
-    )
-    st.session_state["feed_wizard_schedule"] = {
-        "frequency": freq,
-        "time": str(time),
-        "notify": notify,
-    }
-    if st.button("Save schedule preferences", key="feed_wizard_schedule_save"):
-        st.session_state["feed_wizard_schedule_saved"] = True
-        st.session_state["feed_wizard_step"] = 3
-        st.success("Schedule preferences saved. Automation hooks coming soon!")
 
 
 def _ingest_files(
@@ -358,13 +331,11 @@ def _render_filter_lab(dataframes: dict[str, pd.DataFrame]) -> None:
 
 
 def render_feed_wizard(api_base: str) -> None:
-    steps = ["Upload", "Review & Manifest", "Schedule"]
+    steps = ["Upload", "Review & Manifest"]
     current_step = st.session_state.get("feed_wizard_step", 1)
     last_result = st.session_state.get("feed_wizard_last_result")
     if last_result and last_result.get("status") == "success":
         current_step = max(current_step, 2)
-    if st.session_state.get("feed_wizard_schedule_saved"):
-        current_step = max(current_step, 3)
     st.session_state["feed_wizard_step"] = current_step
 
     _render_stepper(steps, current_step)
@@ -497,9 +468,13 @@ def render_feed_wizard(api_base: str) -> None:
                     key=f"open_quick_{version_meta.get('number', 1)}",
                 ):
                     st.session_state["quick_insight_seed"] = {
-                        "sha16": version_meta.get("sha16"),
-                        "sheet": summary_json.get("sheet"),
-                        "filename": result.get("feed", {}).get("name", "feed") + ".csv",
+                        "kind": "feed_version",
+                        "identifier": result.get("feed", {}).get("identifier"),
+                        "name": result.get("feed", {}).get("name"),
+                        "version": version_meta,
+                        "summary": summary_json,
+                        "profile": result.get("profile", {}),
+                        "schema": result.get("schema", {}),
                     }
                     st.session_state["workspace_mode"] = "Quick Insight"
                     st.rerun()
@@ -507,11 +482,6 @@ def render_feed_wizard(api_base: str) -> None:
             if manifest:
                 _render_manifest_preview(manifest)
             _render_drift_summary(results)
-
-        if st.session_state.get("feed_wizard_step", 1) < 3 and st.button(
-            "Next: scheduling & automation", key="feed_wizard_go_schedule"
-        ):
-            st.session_state["feed_wizard_step"] = 3
 
         if st.button("🔁 Re-run ingestion", key="feed_wizard_rerun"):
             saved = st.session_state.get("feed_wizard_last_result", {})
@@ -543,7 +513,5 @@ def render_feed_wizard(api_base: str) -> None:
                     st.session_state["feed_wizard_last_result"]["data"] = results
                     st.success("Feed refreshed! All summaries are up to date.")
 
-    if st.session_state.get("feed_wizard_step", 1) >= 3:
-        _render_schedule_section()
-    elif last_result and last_result.get("status") == "error":
+    if last_result and last_result.get("status") == "error":
         st.error(last_result.get("message", "Unknown error"))

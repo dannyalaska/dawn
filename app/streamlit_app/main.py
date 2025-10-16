@@ -39,7 +39,7 @@ st.set_page_config(
 
 def _init_session_state() -> None:
     defaults: dict[str, Any] = {
-        "dawn_preview_data": None,
+        "dawn_preview_data": {},
         "dawn_preview_summary": None,
         "dawn_preview_upload": None,
         "dawn_last_index_result": None,
@@ -426,6 +426,8 @@ def _fetch_rag_ping() -> dict[str, Any]:
 
 
 def _fetch_jobs() -> list[dict[str, Any]]:
+    refresh_token = st.session_state.get("dawn_jobs_refresh_token")
+    _ = refresh_token
     try:
         resp = requests.get(f"{API_BASE}/jobs", timeout=5)
         resp.raise_for_status()
@@ -450,6 +452,363 @@ def _run_job_now(job_id: int) -> dict[str, Any] | None:
     except Exception as exc:  # noqa: BLE001
         st.error(f"Job run failed: {exc}")
         return None
+
+
+def _fetch_feed_catalog() -> list[dict[str, Any]]:
+    refresh_token = st.session_state.get("dawn_feed_refresh_token")
+    _ = refresh_token  # appease lint; token is read to trigger reruns
+    try:
+        resp = requests.get(f"{API_BASE}/feeds", timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        st.session_state["dawn_feed_catalog_error"] = str(exc)
+        return []
+
+    st.session_state.pop("dawn_feed_catalog_error", None)
+    if isinstance(data, dict):
+        feeds = data.get("feeds")
+        if isinstance(feeds, list):
+            return feeds
+    return []
+
+
+def _apply_feed_to_quick_insight(feed: dict[str, Any]) -> bool:
+    latest = feed.get("latest_version") or {}
+    summary = latest.get("summary") or {}
+    profile = latest.get("profile") or {}
+    schema = latest.get("schema") or {}
+    sample_rows = summary.get("sample_rows") or profile.get("sample_rows") or []
+    if not sample_rows:
+        st.warning("No sample rows stored yet. Re-ingest or preview the feed to snapshot data.")
+        return False
+    columns_schema = schema.get("columns") or []
+    if not columns_schema:
+        st.warning("Column metadata missing; cannot load Quick Insight view.")
+        return False
+
+    raw_row_count = summary.get("row_count") or profile.get("row_count")
+    raw_col_count = (
+        summary.get("column_count") or profile.get("column_count") or len(columns_schema)
+    )
+    total_rows = int(raw_row_count) if isinstance(raw_row_count, int | float) else len(sample_rows)
+    total_cols = (
+        int(raw_col_count) if isinstance(raw_col_count, int | float) else len(columns_schema)
+    )
+
+    preview_columns: list[dict[str, Any]] = []
+    for column in columns_schema:
+        name = column.get("name")
+        if not name:
+            continue
+        dtype = column.get("dtype")
+        non_null_raw = column.get("non_null")
+        non_null_val = int(non_null_raw) if isinstance(non_null_raw, int | float) else None
+        nulls_val: int | None = None
+        if non_null_val is not None:
+            nulls_val = max(total_rows - non_null_val, 0)
+        samples: list[str] = []
+        for row in sample_rows:
+            if name in row and row[name] is not None:
+                samples.append(str(row[name]))
+            if len(samples) >= 3:
+                break
+        preview_columns.append(
+            {
+                "name": name,
+                "dtype": dtype,
+                "non_null": non_null_val if non_null_val is not None else 0,
+                "nulls": nulls_val if nulls_val is not None else 0,
+                "sample": samples,
+            }
+        )
+
+    sheet_names = (
+        latest.get("sheet_names") or summary.get("sheet_names") or profile.get("sheet_names") or []
+    )
+    sheet = (
+        summary.get("sheet")
+        or latest.get("sheet")
+        or feed.get("favorite_sheet")
+        or (sheet_names[0] if sheet_names else "Sheet1")
+    )
+
+    preview_data = {
+        "sheet": sheet,
+        "shape": (total_rows, total_cols),
+        "columns": preview_columns,
+        "rows": sample_rows,
+    }
+
+    st.session_state["dawn_preview_data"] = preview_data
+    st.session_state["dawn_preview_summary"] = summary
+    st.session_state["dawn_preview_upload"] = None
+    st.session_state["dawn_preview_chart"] = None
+    st.session_state["dawn_last_index_result"] = None
+    st.session_state["dawn_sheet_names"] = sheet_names
+    st.session_state["dawn_selected_sheet"] = sheet
+    st.session_state["dawn_current_sha"] = latest.get("sha16")
+    _update_suggestions(summary)
+    _update_preview_chart(summary)
+    st.toast(f"Loaded {feed.get('name') or feed.get('identifier')} into Quick Insight.", icon="📚")
+    return True
+
+
+def _set_feed_favorite(identifier: str, sheet: str) -> bool:
+    try:
+        resp = requests.post(
+            f"{API_BASE}/feeds/{identifier}/favorite",
+            json={"sheet": sheet},
+            timeout=8,
+        )
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to favorite sheet: {exc}")
+        return False
+    st.toast(f"Favorite sheet set to {sheet}.", icon="⭐️")
+    return True
+
+
+def _create_job(
+    *,
+    name: str,
+    feed_identifier: str,
+    feed_version: int,
+    schedule: str | None,
+    transform_name: str | None,
+    run_after_create: bool,
+) -> dict[str, Any] | None:
+    payload: dict[str, Any] = {
+        "name": name,
+        "feed_identifier": feed_identifier,
+        "feed_version": feed_version,
+        "schedule": schedule,
+        "is_active": True,
+    }
+    if transform_name:
+        payload["transform_name"] = transform_name
+    try:
+        resp = requests.post(f"{API_BASE}/jobs", json=payload, timeout=12)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to create job: {exc}")
+        return None
+    job = resp.json()
+    st.toast(f"Job “{job.get('name', name)}” created.", icon="🛠️")
+    job_id = job.get("id")
+    if run_after_create and job_id:
+        _run_job_now(int(job_id))
+    return job
+
+
+def _render_feed_overview(feeds: list[dict[str, Any]]) -> None:
+    st.markdown("### 📚 Registered feeds")
+    controls = st.columns([3, 1], vertical_alignment="center")
+    with controls[1]:
+        if st.button("Refresh feeds", key="dawn_refresh_feeds"):
+            st.session_state["dawn_feed_refresh_token"] = time.time()
+            st.experimental_rerun()
+
+    error_msg = st.session_state.get("dawn_feed_catalog_error")
+    if not feeds:
+        if error_msg:
+            st.error(f"Failed to load feeds: {error_msg}")
+        else:
+            st.info("Ingest a dataset to populate your feed library.")
+        return
+
+    options = [
+        f"{feed.get('name') or feed['identifier']} · `{feed['identifier']}`" for feed in feeds
+    ]
+    identifier_map = {feed["identifier"]: idx for idx, feed in enumerate(feeds)}
+    current_identifier = st.session_state.get("dawn_feed_selected")
+    default_index = identifier_map.get(current_identifier, 0)
+    selection = st.selectbox(
+        "Pick a feed",
+        options,
+        index=default_index if 0 <= default_index < len(options) else 0,
+        key="dawn_feed_selector",
+    )
+    selected_idx = options.index(selection)
+    selected_feed = feeds[selected_idx]
+    identifier = selected_feed["identifier"]
+    st.session_state["dawn_feed_selected"] = identifier
+
+    latest = selected_feed.get("latest_version") or {}
+    summary = latest.get("summary") or {}
+    columns_info = summary.get("columns") or []
+    metrics_info = summary.get("metrics") or []
+    plan_info = summary.get("analysis_plan") or []
+    sample_rows = summary.get("sample_rows") or latest.get("profile", {}).get("sample_rows") or []
+
+    def _fmt_int(value: Any) -> str:
+        try:
+            return f"{int(value):,}"
+        except Exception:
+            return "—"
+
+    owner = selected_feed.get("owner") or "—"
+    src_type = selected_feed.get("source_type") or "—"
+    st.caption(f"Owner: {owner} • Source: {src_type}")
+
+    metrics_cols = st.columns(4)
+    metrics_cols[0].metric("Rows", _fmt_int(latest.get("rows")))
+    metrics_cols[1].metric("Columns", _fmt_int(latest.get("columns")))
+    metrics_cols[2].metric("Version", f"v{latest.get('number', '—')}")
+    metrics_cols[3].metric("Favorite sheet", selected_feed.get("favorite_sheet") or "—")
+
+    action_cols = st.columns([1, 1, 1])
+    open_clicked = action_cols[0].button(
+        "Open in Quick Insight",
+        key=f"dawn_feed_open_{selected_feed['identifier']}",
+    )
+    if open_clicked and _apply_feed_to_quick_insight(selected_feed):
+        st.session_state["workspace_mode"] = "Quick Insight"
+        st.session_state.pop("quick_insight_seed", None)
+        st.rerun()
+
+    sheet_names = (
+        latest.get("sheet_names")
+        or summary.get("sheet_names")
+        or latest.get("profile", {}).get("sheet_names")
+        or selected_feed.get("favorite_sheet")
+        or []
+    )
+    if isinstance(sheet_names, str):
+        sheet_names = [sheet_names]
+    if sheet_names:
+        try:
+            default_sheet_index = sheet_names.index(
+                selected_feed.get("favorite_sheet") or summary.get("sheet") or sheet_names[0],
+            )
+        except ValueError:
+            default_sheet_index = 0
+    sheet_col, star_col = st.columns([3, 1])
+    picked_sheet = sheet_col.selectbox(
+        "Worksheet",
+        sheet_names,
+        index=default_sheet_index,
+        key=f"dawn_sheet_choice_{identifier}",
+    )
+    favorite_clicked = star_col.button("⭐ Favorite", key=f"dawn_favorite_sheet_{identifier}")
+    if favorite_clicked and _set_feed_favorite(identifier, picked_sheet):
+        st.rerun()
+
+    if metrics_info:
+        st.markdown("#### Highlights")
+        metric_columns = st.columns(max(1, min(2, len(metrics_info))))
+        for idx, metric in enumerate(metrics_info[:4]):
+            with metric_columns[idx % len(metric_columns)]:
+                label = metric.get("description") or metric.get("column") or "Metric"
+                values = metric.get("values") or []
+                df_metric = pd.DataFrame(values)
+                if not df_metric.empty:
+                    df_metric.columns = ["Value", "Count"]
+                    st.markdown(f"**{label}**")
+                    st.table(df_metric)
+
+    if columns_info:
+        st.markdown("#### Column signals")
+        for column in columns_info[:5]:
+            name = column.get("name")
+            dtype = column.get("dtype")
+            top_values = column.get("top_values") or []
+            stats = column.get("stats") or {}
+            if top_values:
+                preview = ", ".join(f"{label} ({count})" for label, count in top_values[:3])
+                st.write(f"- **{name}** ({dtype}) → {preview}")
+            elif stats:
+                stat_preview = ", ".join(f"{k}={v:.2f}" for k, v in stats.items())
+                st.write(f"- **{name}** ({dtype}) → {stat_preview}")
+            else:
+                st.write(f"- **{name}** ({dtype})")
+
+    if plan_info:
+        st.markdown("#### Analysis plan")
+        for step in plan_info[:6]:
+            parts = [
+                str(step.get("type", "step")),
+                str(step.get("column") or step.get("group") or ""),
+            ]
+            if step.get("value"):
+                parts.append(str(step["value"]))
+            if step.get("stat"):
+                parts.append(str(step["stat"]))
+            joined = " · ".join(part for part in parts if part)
+            st.write(f"- {joined}")
+
+    if sample_rows:
+        st.markdown("#### Sample rows")
+        sample_df = pd.DataFrame(sample_rows)
+        st.dataframe(sample_df, use_container_width=True, height=260)
+
+    version_number = latest.get("number")
+    version_number_int = int(version_number) if isinstance(version_number, int | float) else None
+    if version_number:
+        context_source = f"feed:{identifier}:v{version_number}"
+        context_chunks = _fetch_context_chunks(context_source)
+        note_chunks = [
+            chunk for chunk in context_chunks if str(chunk.get("type", "")).lower() == "note"
+        ]
+        st.markdown("#### Memory notes")
+        if note_chunks:
+            for note in note_chunks:
+                st.write(f"- {note.get('text', '')}")
+        else:
+            st.caption("Capture unit conventions, business rules, or playbook tips here.")
+
+        with st.form(f"dawn_context_note_form_{identifier}", clear_on_submit=False):
+            note_text = st.text_area(
+                "Add a note for assistants & automations",
+                key=f"dawn_context_note_area_{identifier}",
+                height=110,
+            )
+            note_saved = st.form_submit_button("Save note")
+        if note_saved and _add_context_note(note_text, source=context_source):
+            st.success("Note saved.")
+            st.rerun()
+
+    if version_number_int:
+        st.markdown("#### Automation")
+        default_job_name = f"{selected_feed.get('name') or identifier} refresh"
+        with st.form(f"dawn_job_form_{identifier}", clear_on_submit=False):
+            job_name = st.text_input(
+                "Job name",
+                value=default_job_name,
+                key=f"dawn_job_name_{identifier}",
+            )
+            schedule_value = st.text_input(
+                "Schedule (cron)",
+                value="0 9 * * 1-5",
+                help="Use cron format (e.g., 0 9 * * 1-5 for weekdays at 9am). Leave blank for manual runs.",
+                key=f"dawn_job_schedule_{identifier}",
+            )
+            transform_value = st.text_input(
+                "Transform name (optional)",
+                value="",
+                key=f"dawn_job_transform_{identifier}",
+            )
+            run_now = st.checkbox(
+                "Run immediately after creating",
+                value=True,
+                key=f"dawn_job_run_now_{identifier}",
+            )
+            job_submit = st.form_submit_button("Create job")
+        if job_submit:
+            cleaned_name = job_name.strip() or default_job_name
+            schedule_clean = schedule_value.strip() or None
+            transform_clean = transform_value.strip() or None
+            created_job = _create_job(
+                name=cleaned_name,
+                feed_identifier=identifier,
+                feed_version=version_number_int,
+                schedule=schedule_clean,
+                transform_name=transform_clean,
+                run_after_create=run_now,
+            )
+            if created_job:
+                st.session_state["dawn_jobs_refresh_token"] = time.time()
+                st.rerun()
 
 
 def _render_jobs_panel(jobs: list[dict[str, Any]]) -> None:
@@ -817,12 +1176,12 @@ def _update_context_chunk(chunk_id: str, text: str) -> bool:
     return True
 
 
-def _add_context_note(text: str) -> bool:
-    source = _current_context_source()
-    if not source:
+def _add_context_note(text: str, *, source: str | None = None) -> bool:
+    target = source or _current_context_source()
+    if not target:
         st.warning("Index a dataset before adding context notes.")
         return False
-    payload = {"source": source, "text": text.strip()}
+    payload = {"source": target, "text": text.strip()}
     if not payload["text"]:
         st.warning("Write a note before saving it to context.")
         return False
@@ -979,7 +1338,26 @@ def main() -> None:
     if mode == "Quick Insight":
         seed = st.session_state.pop("quick_insight_seed", None)
         if seed:
-            _handle_replay(seed)
+            if isinstance(seed, dict) and seed.get("kind") == "feed_version":
+                payload = {
+                    "identifier": seed.get("identifier"),
+                    "name": seed.get("name"),
+                    "favorite_sheet": (seed.get("summary") or {}).get("sheet"),
+                    "latest_version": {
+                        "number": (seed.get("version") or {}).get("number"),
+                        "rows": (seed.get("summary") or {}).get("row_count"),
+                        "columns": (seed.get("summary") or {}).get("column_count"),
+                        "sha16": (seed.get("version") or {}).get("sha16"),
+                        "summary": seed.get("summary"),
+                        "profile": seed.get("profile"),
+                        "schema": seed.get("schema"),
+                        "sheet": (seed.get("summary") or {}).get("sheet"),
+                        "sheet_names": (seed.get("summary") or {}).get("sheet_names"),
+                    },
+                }
+                _apply_feed_to_quick_insight(payload)
+            else:
+                _handle_replay(seed)
 
         quick_main, quick_chat = st.columns([3.7, 1.3], gap="large", vertical_alignment="top")
 
@@ -1039,6 +1417,9 @@ def main() -> None:
     elif mode == "Datafeed Studio":
         st.session_state.pop("quick_insight_seed", None)
         render_feed_wizard(API_BASE)
+        st.divider()
+        feeds = _fetch_feed_catalog()
+        _render_feed_overview(feeds)
         st.divider()
         jobs = _fetch_jobs()
         _render_jobs_panel(jobs)

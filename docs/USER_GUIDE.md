@@ -137,6 +137,9 @@ If your analysis proves valuable:
    - Row/column counts
    - Last updated timestamp
    - Drift status
+   - Sample rows, value-count cards, and the auto analysis plan
+   - Favorite worksheet selector and context note history
+   - One-click automation form to schedule refresh jobs
 
 ### Understanding Drift
 When you upload a new version, DAWN detects:
@@ -150,11 +153,11 @@ When you upload a new version, DAWN detects:
 - 🆕 **New**: First version
 
 ### Querying Feed Data
-Click **"Query"** on any feed card to:
-1. Switch to Quick Insight mode
-2. Pre-load feed schema context
-3. Ask natural language questions
-4. Generate SQL automatically
+Click **"Open in Quick Insight"** on any feed to:
+1. Jump into Quick Insight with sample rows already staged
+2. Reuse the stored summary for suggested questions
+3. Ask natural language questions immediately
+4. Generate SQL automatically against cached metrics
 
 ### Exporting Feeds
 (Coming in Sprint 2)

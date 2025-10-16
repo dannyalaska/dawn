@@ -84,6 +84,94 @@ response = requests.post("http://127.0.0.1:8000/feeds/ingest", data=data)
 
 ---
 
+### GET `/feeds`
+List all registered feeds with their latest version metadata.
+
+**Response:**
+```json
+{
+  "feeds": [
+    {
+      "identifier": "support_tickets",
+      "name": "Support Tickets",
+      "owner": "Ops Enablement",
+      "source_type": "upload",
+      "format": "excel",
+      "favorite_sheet": "Tickets",
+      "latest_version": {
+        "number": 1,
+        "rows": 1200,
+        "columns": 14,
+        "sha16": "a1b2c3d4e5f6",
+        "sheet": "Tickets",
+        "sheet_names": ["Tickets", "Agents"],
+        "summary": {...},
+        "profile": {...},
+        "schema": {...}
+      }
+    }
+  ]
+}
+```
+`summary`, `profile`, and `schema` mirror the structures returned from ingestion, including `sample_rows`, analysis plans, and column profiling.
+
+---
+
+### GET `/feeds/{identifier}`
+Fetch all stored versions for a specific feed.
+
+**Response:**
+```json
+{
+  "identifier": "support_tickets",
+  "name": "Support Tickets",
+  "favorite_sheet": "Tickets",
+  "latest_version": {
+    "number": 2,
+    "rows": 1500,
+    "columns": 16,
+    "summary": {...}
+  },
+  "versions": [
+    {
+      "number": 2,
+      "rows": 1500,
+      "columns": 16,
+      "sha16": "aaaabbbbccccdddd",
+      "created_at": "2024-05-01T10:12:55",
+      "summary": {...},
+      "profile": {...},
+      "schema": {...}
+    },
+    {
+      "number": 1,
+      "rows": 1200,
+      "columns": 14,
+      "sha16": "1111222233334444",
+      "created_at": "2024-04-15T08:21:12",
+      "summary": {...},
+      "profile": {...},
+      "schema": {...}
+    }
+  ]
+}
+```
+
+---
+
+### POST `/feeds/{identifier}/favorite`
+Persist the default worksheet to highlight in the UI.
+
+**Request Body:**
+```json
+{ "sheet": "Tickets" }
+```
+
+**Response:**
+Returns the updated feed payload (same shape as `GET /feeds/{identifier}`).
+
+---
+
 ## Jobs API
 
 ### GET `/jobs`

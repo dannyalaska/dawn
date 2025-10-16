@@ -62,36 +62,35 @@ def execute_job(job_id: int) -> dict[str, Any]:
     Raises:
         JobError: If job is not found or execution fails
     """
+    transform_version_id: int | None
+    feed_rows: int
     with session_scope() as session:
         job = session.get(Job, job_id)
         if job is None:
             raise JobError(f"Job id={job_id} not found")
 
-        run = JobRun(
-            job_id=job_id,
-            status="running",
-            started_at=datetime.utcnow(),
-        )
+        feed_version = session.get(FeedVersion, job.feed_version_id)
+        if feed_version is None:
+            raise JobError(f"Feed version id={job.feed_version_id} not found")
+        transform_version_id = job.transform_version_id
+        run = JobRun(job_id=job_id, status="running", started_at=datetime.utcnow())
         session.add(run)
-        session.flush()  # Get run.id
+        session.flush()
         run_id = run.id
+        feed_rows = feed_version.row_count or 0
 
     try:
-        feed_version = session.get(FeedVersion, job.feed_version_id)
-        transform_version = (  # noqa: F841 (TODO: implement transform execution)
-            session.get(TransformVersion, job.transform_version_id)
-            if job.transform_version_id
-            else None
-        )
+        transform_dry_run: dict[str, Any] | None = None
+        if transform_version_id is not None:
+            with session_scope() as session:
+                transform_version = session.get(TransformVersion, transform_version_id)
+            if transform_version is None:
+                raise JobError(f"Transform version id={transform_version_id} not found")
+            transform_dry_run = dict(transform_version.dry_run_report or {})
 
-        if feed_version is None:
-            raise JobError(
-                f"Feed version id={job.feed_version_id} not found"
-            )  # TODO: Actually process the data here based on feed_version and transform_version
-        # For now, just simulate success
         status = "success"
-        rows_in = feed_version.row_count or 0
-        rows_out = rows_in
+        rows_in = feed_rows
+        rows_out = feed_rows
         validation: dict[str, Any] = {}
         warnings: list[dict[str, Any]] = []
         logs: list[dict[str, Any]] = [
@@ -101,6 +100,9 @@ def execute_job(job_id: int) -> dict[str, Any]:
                 "message": f"Processed {rows_in} rows",
             }
         ]
+        if transform_dry_run:
+            validation["dry_run"] = transform_dry_run
+        # TODO: Use transform_version to run actual data processing when implemented.
         return _finalize_job_run(
             job_id=job_id,
             run_id=run_id,

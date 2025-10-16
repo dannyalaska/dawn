@@ -29,8 +29,12 @@ class Condition:
         else:
             comp_value = self.value
         if self.op == "eq":
+            if pd.api.types.is_string_dtype(series) or series.dtype == object:
+                return series.astype(str).str.casefold() == str(comp_value).casefold()
             return series == comp_value
         if self.op == "neq":
+            if pd.api.types.is_string_dtype(series) or series.dtype == object:
+                return series.astype(str).str.casefold() != str(comp_value).casefold()
             return series != comp_value
         if self.op == "gt":
             return series > comp_value
@@ -86,6 +90,61 @@ def _column_map(columns: Iterable[str]) -> dict[str, str]:
     return dict(sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True))
 
 
+def _heuristic_column(segment: str, column_lookup: dict[str, str]) -> str | None:
+    words = set(segment.split())
+    if not words:
+        return None
+
+    status_tokens = {"resolved", "unresolved", "open", "closed", "pending", "escalated", "active"}
+    status_hints = ("status", "state", "resolution", "outcome", "stage")
+    if words & status_tokens:
+        for norm_name, original in column_lookup.items():
+            if any(hint in norm_name for hint in status_hints):
+                return original
+
+    owner_tokens = {"owner", "assignee", "agent", "handler"}
+    owner_hints = ("owner", "assignee", "agent", "handler", "resolver")
+    if words & owner_tokens:
+        for norm_name, original in column_lookup.items():
+            if any(hint in norm_name for hint in owner_hints):
+                return original
+
+    priority_tokens = {"urgent", "priority", "high", "medium", "low", "severity"}
+    priority_hints = ("priority", "severity", "impact")
+    if words & priority_tokens:
+        for norm_name, original in column_lookup.items():
+            if any(hint in norm_name for hint in priority_hints):
+                return original
+
+    return None
+
+
+def _heuristic_value(segment: str, column_name: str) -> object | None:
+    tokens = segment.split()
+    if not tokens:
+        return None
+    lower_column = column_name.lower()
+    if any(hint in lower_column for hint in ("status", "state", "resolution", "stage")):
+        status_map = {
+            "resolved": "resolved",
+            "unresolved": "unresolved",
+            "pending": "pending",
+            "open": "open",
+            "closed": "closed",
+            "escalated": "escalated",
+            "active": "active",
+        }
+        for token in reversed(tokens):
+            token_clean = token.strip().lower()
+            if token_clean in status_map:
+                return status_map[token_clean]
+        # handle phrases like "yet to be resolved"
+        for key, value in status_map.items():
+            if key in segment:
+                return value
+    return None
+
+
 def _to_number(value: str) -> object:
     value = value.strip()
     try:
@@ -118,6 +177,8 @@ def _parse_condition(segment: str, columns: Iterable[str]) -> Condition | None:
             segment = segment.replace(norm_name, "").strip()
             break
     if not column_selected:
+        column_selected = _heuristic_column(segment, column_lookup)
+    if not column_selected:
         return None
     op_code: ConditionOp = "eq"
     for pattern, code in _OP_PATTERNS:
@@ -126,6 +187,9 @@ def _parse_condition(segment: str, columns: Iterable[str]) -> Condition | None:
             segment = segment.replace(pattern, "").strip()
             break
     value = _extract_value(segment)
+    heuristic_value = _heuristic_value(segment, column_selected)
+    if heuristic_value is not None:
+        value = heuristic_value
     if op_code in _NUMERIC_OPS and not isinstance(value, int | float):
         value = _to_number(str(value))
     if value == "":
