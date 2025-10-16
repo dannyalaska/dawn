@@ -84,24 +84,30 @@ def execute_job(job_id: int) -> dict[str, Any]:
         if transform_version_id is not None:
             with session_scope() as session:
                 transform_version = session.get(TransformVersion, transform_version_id)
-            if transform_version is None:
-                raise JobError(f"Transform version id={transform_version_id} not found")
-            transform_dry_run = dict(transform_version.dry_run_report or {})
+                if transform_version is None:
+                    raise JobError(f"Transform version id={transform_version_id} not found")
+                transform_dry_run = dict(transform_version.dry_run_report or {})
 
         status = "success"
+        warnings: list[dict[str, Any]] = []
+        validation: dict[str, Any] = {}
         rows_in = feed_rows
         rows_out = feed_rows
-        validation: dict[str, Any] = {}
-        warnings: list[dict[str, Any]] = []
+        if transform_dry_run:
+            rows_in = int(transform_dry_run.get("rows_before", feed_rows))
+            rows_out = int(transform_dry_run.get("rows_after", rows_in))
+            removed = transform_dry_run.get("columns_removed") or []
+            if removed:
+                warnings.append({"type": "columns_removed", "details": removed})
+            validation["dry_run"] = transform_dry_run
+
         logs: list[dict[str, Any]] = [
             {
                 "ts": datetime.utcnow().isoformat(),
                 "level": "info",
-                "message": f"Processed {rows_in} rows",
+                "message": f"Processed rows_in={rows_in} rows_out={rows_out}",
             }
         ]
-        if transform_dry_run:
-            validation["dry_run"] = transform_dry_run
         # TODO: Use transform_version to run actual data processing when implemented.
         return _finalize_job_run(
             job_id=job_id,
