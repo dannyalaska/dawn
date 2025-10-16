@@ -7,6 +7,8 @@
 ## Authentication
 Currently no authentication required (add in production deployment).
 
+Provide API keys, database DSNs, and other secrets through environment variables (`.env` is ignored by git). Nothing in this repository contains live credentials.
+
 ---
 
 ## Feeds API

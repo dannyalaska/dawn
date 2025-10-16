@@ -15,6 +15,10 @@ venv/
 .env
 *.env
 
+# Local database files
+*.sqlite3
+*.db
+
 # Coverage / testing
 .coverage
 coverage.xml

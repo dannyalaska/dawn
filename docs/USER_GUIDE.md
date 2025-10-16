@@ -21,6 +21,8 @@ DAWN (Data Awareness & Workflow Navigator) is a platform for managing, transform
 - **Transform pipelines** with version control
 - **Scheduled jobs** for automated refresh
 
+> **Note:** All sample workbooks and transform definitions in this repo are synthetic and safe to share publicly. Bring your own data by copying `.env.example` → `.env` and pointing DAWN at your Redis/Postgres instances.
+
 ### Starting DAWN
 ```bash
 cd /path/to/dawn

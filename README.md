@@ -47,6 +47,15 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 - Postgres 13+
 - Optional: LM Studio or Ollama
 
+### Start dependencies
+The repo ships with a local docker-compose stack:
+
+```bash
+docker compose -f infra/docker-compose.dev.yml up -d
+```
+
+This brings up Redis + Postgres with development credentials that should never be used in production. Point your `.env` at whichever Redis/Postgres instance you prefer; SQLite artifacts are intentionally excluded from version control.
+
 ### Install
 ```bash
 git clone https://github.com/dannyalaska/dawn.git
@@ -67,6 +76,12 @@ cp .env.example .env
 - API → `http://127.0.0.1:8000`
 - Streamlit → `http://127.0.0.1:8501`
 
+### Sample data
+- `demo_assets/support_copilot_demo.xlsx` — synthetic support tickets with agents + KPIs.
+- `demo_assets/support_transform.json` — example transform definition + sample rows.
+
+Feel free to delete these files if you do not want demo content in your fork. They never contain real customer or company data.
+
 ## Development commands
 
 ```bash
@@ -76,6 +91,14 @@ poetry run pytest
 ```
 
 Pre-commit is configured (`poetry run pre-commit run --all-files`).
+
+---
+
+## Security & privacy
+- `.env` and any other credential files are ignored by git. Copy from `.env.example` and keep secrets out of commits.
+- Local SQLite databases (`*.sqlite3`, `*.db`) are ignored to prevent leaking run history. Run `poetry run alembic upgrade head` against your configured Postgres instance instead.
+- Configure LLM access keys via environment variables at runtime (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.). They are never baked into source.
+- Sample data and docs contain only synthetic names and values so you can share the repo publicly.
 
 ---
 
