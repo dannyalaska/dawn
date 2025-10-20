@@ -203,9 +203,10 @@ def test_context_endpoints(client, monkeypatch):
 
     final_resp = client.get("/rag/context", params={"source": "demo:Sheet1"})
     assert final_resp.status_code == 200, final_resp.text
-    final_chunks = final_resp.json()["chunks"]
-    assert final_resp.json()["count"] >= 2
-    assert any(c["type"] == "note" and c["text"] for c in final_chunks)
+    final_payload = final_resp.json()
+    final_notes = final_payload.get("notes") or final_payload.get("chunks") or []
+    assert final_payload["count"] >= 2
+    assert any(c["type"] == "note" and c["text"] for c in final_notes)
 
 
 def test_memory_endpoints(client, monkeypatch):

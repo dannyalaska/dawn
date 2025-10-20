@@ -385,8 +385,13 @@ def list_context(
     source_clean = source.strip()
     if not source_clean:
         raise HTTPException(400, "source must be provided")
-    chunks = list_context_chunks(source=source_clean, limit=limit)
-    return {"source": source_clean, "count": len(chunks), "chunks": chunks}
+    notes = list_context_chunks(source=source_clean, limit=limit)
+    return {
+        "source": source_clean,
+        "count": len(notes),
+        "notes": notes,
+        "chunks": notes,  # backwards compatibility for older clients
+    }
 
 
 @router.put("/context/{chunk_id}")

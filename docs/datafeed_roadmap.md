@@ -112,7 +112,7 @@ flowchart LR
 ## Roadmap by Sprint
 
 ### Sprint 1 — Schema & Validation Foundations
-- [x] Multi-step onboarding wizard with manifest preview & scheduling placeholder.
+- [x] Simplified upload & preview workspace with manifest summary and indexing hand-off.
 - [x] Profiling engine upgrades for schema inference & drift metrics.
 - [x] Auto DQ rule framework (PK uniqueness, null thresholds, datetime checks).
 - [x] Change summaries between versions (rows, columns, null deltas).
@@ -124,8 +124,7 @@ flowchart LR
 - Job scheduling UI (cron presets, manual runs, notifications).
 - Row embeddings + Redis vector index per feed.
 - NL-to-SQL enhancements with context-aware question suggestions.
-- Split Quick Insight vs Datafeed Studio workspaces with cross-linking.
-- “Promote to feed” flow from Quick Insight and “Open in Quick Insight” from feed cards.
+- Iterate on the tabbed Streamlit experience (Upload & Preview, Context & Memory, Ask Dawn).
 - Unified data access layer (feeds + ad-hoc uploads) powering both workspaces.
 - Feed export planner with manifest-driven targets (S3 + local outbox initial).
 - Export configuration UI (target selection, format, schedule, notifications).
@@ -144,7 +143,7 @@ flowchart LR
 - Natural language SQL editor with live preview + execution sandbox.
 
 ## Sprint 1 Backlog Snapshot
-- [x] Design Streamlit wizard steps & copy (source selection, schema review, scheduling placeholder).
+- [x] Design streamlined upload→index flow with clear copy.
 - [x] Upgrade profiling pipeline to capture schema drift & change metrics.
 - [x] Auto-generate manifests and expose for download/edit.
 - [x] Persist & display detailed summary cards (schema, PK/FK, drift, DQ).
@@ -158,4 +157,4 @@ flowchart LR
 - [ ] Implement job scheduler with background worker (APScheduler)
 - [ ] Add manual job trigger endpoints
 - [ ] Test scheduled execution end-to-end
-- [ ] Update feed wizard to create actual scheduled jobs
+- [ ] Extend indexing UI with schedule configuration hooks

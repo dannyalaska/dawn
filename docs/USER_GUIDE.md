@@ -3,7 +3,7 @@
 ## Table of Contents
 1. [Getting Started](#getting-started)
 2. [Feed Onboarding](#feed-onboarding)
-3. [Using Quick Insight](#using-quick-insight)
+3. [Asking Questions](#asking-questions)
 4. [Working with Datafeeds](#working-with-datafeeds)
 5. [Creating Transforms](#creating-transforms)
 6. [Scheduling Jobs](#scheduling-jobs)
@@ -39,46 +39,25 @@ Visit `http://127.0.0.1:8501` in your browser to access the UI.
 
 ## Feed Onboarding
 
-### Step 1: Select Workspace Mode
-1. Open DAWN in your browser
-2. Click **"Datafeed Studio"** in the sidebar
-3. You'll see the Feed Wizard interface
+### Step 1: Upload from “Upload & Preview”
+1. Open DAWN in your browser and stay on the default **Upload & Preview** tab.
+2. Drag an Excel workbook (`.xlsx`, `.xlsm`, `.xls`) into the uploader.
+3. Optionally provide a sheet name; otherwise Dawn inspects the first sheet.
+4. Click **Generate preview** to profile the workbook locally.
 
-### Step 2: Upload Your Data
-**Option A: File Upload**
-1. Click **"Upload files"** or drag-and-drop
-2. Supports: CSV, Excel (.xlsx, .xlsm, .xls)
-3. Multiple files and ZIP archives supported
+### Step 2: Inspect the profile
+After the preview finishes you’ll see:
+- Row/column counts and whether the preview was served from cache.
+- Column-level metadata (dtype, sample values, null counts).
+- The first 50 sample rows to spot obvious data issues.
 
-**Option B: S3 Source (Coming in Sprint 2)**
-1. Select "S3" as source type
-2. Enter S3 path: `s3://bucket/path/file.csv`
-3. Configure credentials (future)
+If the preview looks off, update the sheet selector and rerun the preview.
 
-**Option C: HTTP Source**
-1. Select "HTTP" as source type
-2. Enter URL to downloadable file
-3. DAWN will fetch and process
-
-### Step 3: Configure Feed Metadata
-After upload, you'll see a preview:
-
-1. **Feed Identifier**: Unique name (e.g., "customers", "transactions")
-   - Use lowercase, underscores for spaces
-   - Cannot be changed after creation
-
-2. **Display Name**: Human-readable name (e.g., "Customer Master Data")
-
-3. **Owner**: Team or person responsible
-
-4. **Description**: Purpose and contents (auto-suggested by AI)
-
-### Step 4: Review Schema & Profile
-DAWN automatically:
-- **Infers schema**: Column names, types, nullability
-- **Detects primary keys**: Based on uniqueness
-- **Suggests foreign keys**: Links to other feeds
-- **Generates metrics**: Row counts, null percentages, value distributions
+### Step 3: Index it into Redis
+1. Adjust note size, overlap, and retrieval `k` from the sidebar if needed.
+2. Click **Index dataset** to capture context notes and push vectors into Redis.
+3. When indexing completes Dawn stores a richer summary (top values, aggregates, analysis plan suggestions).
+4. The app automatically switches the active context source so you can move straight to note taking or Q&A.
 
 Review the schema cards and adjust if needed.
 
@@ -107,65 +86,39 @@ Click **"Create Feed"** to:
 
 ---
 
-## Using Quick Insight
+## Asking Questions
 
-Quick Insight is for **ad-hoc analysis** without creating formal feeds.
+The **Ask Dawn** tab replaces the older Quick Insight workspace. It focuses on retrieval-augmented answers grounded in the context notes you just captured.
 
-### Upload for Analysis
-1. Select **"Quick Insight"** in sidebar
-2. Upload CSV/Excel file
-3. Ask questions immediately
+### Run a question
+1. Switch to **Ask Dawn**.
+2. Pick a suggested prompt or type your own question.
+3. Click **Send**. Dawn will search Redis, format the context, and produce an answer.
+4. Use **Regenerate** to re-run the last prompt after refining notes or recall settings.
 
-### Features
-- **Instant preview**: See first 100 rows
-- **Natural language queries**: "Show me records where amount > 1000"
-- **Charts and visualizations**: Auto-generated
-- **No persistence**: Data is temporary
-
-### Promote to Feed
-If your analysis proves valuable:
-1. Click **"Promote this file to Datafeed Studio"**
-2. Complete feed metadata
-3. Now it's tracked with versioning and DQ
+### Tips
+- Suggestions refresh whenever you index a new workbook — they are derived from the stored summary.
+- Adjust `k` from the sidebar to widen or narrow the retrieval window.
+- Answers cite the freshest context; refresh the **Context & Memory** tab if you want to inspect the supporting notes.
 
 ---
 
 ## Working with Datafeeds
 
-### Viewing Feeds
-1. Go to **Datafeed Studio**
-2. See all registered feeds with:
-   - Current version
-   - Row/column counts
-   - Last updated timestamp
-   - Drift status
-   - Sample rows, value-count cards, and the auto analysis plan
-   - Favorite worksheet selector and context note history
-   - One-click automation form to schedule refresh jobs
+Once a workbook is indexed it becomes the active context source for the session.
 
-### Understanding Drift
-When you upload a new version, DAWN detects:
-- **Schema changes**: New/removed/renamed columns
-- **Data changes**: Row count deltas, null rate changes
-- **Relationship changes**: FK candidate changes
+### Reviewing indexed context
+1. Switch to **Context & Memory**.
+2. Click **Refresh context** to pull the live notes from Redis.
+3. Expand any note to read the captured text, tweak the wording, and save it back.
+4. Capture additional nuances with the note form at the bottom of the page.
 
-**Drift Statuses:**
-- ✅ **No Change**: Identical to previous version
-- 📊 **Changed**: Differences detected
-- 🆕 **New**: First version
+### Summaries and drift
+- The **Upload & Preview** tab keeps the latest profiling summary so you can revisit metrics without re-uploading the file.
+- Drift detection for future uploads is surfaced via the FastAPI endpoints (`/feeds` and `/feeds/{identifier}`) and will return to the UI in a later iteration.
 
-### Querying Feed Data
-Click **"Open in Quick Insight"** on any feed to:
-1. Jump into Quick Insight with sample rows already staged
-2. Reuse the stored summary for suggested questions
-3. Ask natural language questions immediately
-4. Generate SQL automatically against cached metrics
-
-### Exporting Feeds
-(Coming in Sprint 2)
-- Export to S3, local file, or SFTP
-- Choose format: CSV, Parquet, JSON
-- Schedule automated exports
+### Automation
+Job scheduling is still available through the REST API (see `docs/API_REFERENCE.md#/jobs`). The simplified Streamlit app focuses on manual previewing, context management, and retrieval QA.
 
 ---
 

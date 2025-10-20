@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import contextlib
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import requests
@@ -21,7 +22,27 @@ from app.core.rag import _ensure_index  # type: ignore[attr-defined]
 from app.core.redis_client import redis_async, redis_sync
 from app.core.scheduler import start_scheduler, stop_scheduler
 
-app = FastAPI(title="DAWN API")
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """FastAPI lifespan handler that wires up shared infrastructure."""
+    init_database()
+    with suppress(Exception):
+        _ensure_index(redis_sync, 384)
+    try:
+        start_scheduler()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[server] Failed to start scheduler: {exc}")
+    try:
+        yield
+    finally:
+        try:
+            stop_scheduler()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[server] Error stopping scheduler: {exc}")
+
+
+app = FastAPI(title="DAWN API", lifespan=_lifespan)
 
 # Dev CORS (tighten in prod)
 app.add_middleware(
@@ -31,29 +52,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def _startup_tasks() -> None:
-    # Ensure DB tables exist and Redis index is ready before serving requests
-    init_database()
-    with contextlib.suppress(Exception):
-        _ensure_index(redis_sync, 384)
-
-    # Start the background job scheduler
-    try:
-        start_scheduler()
-    except Exception as exc:
-        print(f"[server] Failed to start scheduler: {exc}")
-
-
-@app.on_event("shutdown")
-def _shutdown_tasks() -> None:
-    # Stop the scheduler gracefully
-    try:
-        stop_scheduler()
-    except Exception as exc:
-        print(f"[server] Error stopping scheduler: {exc}")
 
 
 async def _check_redis() -> bool:
