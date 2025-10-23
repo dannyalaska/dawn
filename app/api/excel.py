@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from sqlalchemy import delete, desc, select
 
+from app.core.auth import CurrentUser
 from app.core.db import session_scope
 from app.core.excel.ingestion import preview_from_bytes
 from app.core.models import Upload
@@ -18,13 +19,18 @@ file_param = File(...)
 
 
 @router.post("/preview")
-async def preview(sheet: str | None = Query(default=None), file: UploadFile = file_param):
+async def preview(
+    sheet: str | None = Query(default=None),
+    file: UploadFile = file_param,
+    *,
+    current_user: CurrentUser,
+):
     fname = (file.filename or "").lower()
     if not fname.endswith((".xlsx", ".xlsm", ".xls")):
         raise HTTPException(400, "Only Excel files are supported (.xlsx, .xlsm, .xls)")
     content = await file.read()
     try:
-        table = preview_from_bytes(content, sheet_name=sheet)
+        table = preview_from_bytes(content, sheet_name=sheet, user_id=str(current_user.id))
     except Exception as e:
         # keep original error chained for logs/tracebacks
         raise HTTPException(400, f"Failed to read Excel: {e}") from e
@@ -44,6 +50,7 @@ async def preview(sheet: str | None = Query(default=None), file: UploadFile = fi
                     size_bytes=size_bytes,
                     rows=rows,
                     cols=cols,
+                    user_id=current_user.id,
                 )
             )
     except Exception as err:
@@ -61,18 +68,23 @@ async def preview(sheet: str | None = Query(default=None), file: UploadFile = fi
     }
 
 
-def _preview_cache_key(sha16: str, sheet: str | None) -> str:
+def _preview_cache_key(sha16: str, sheet: str | None, user_id: str) -> str:
     # Must match app.core.excel.ingestion.cache_key
     suffix = f":{sheet}" if sheet else ""
-    return f"dawn:dev:preview:{sha16}{suffix}"
+    return f"dawn:dev:preview:{user_id}:{sha16}{suffix}"
 
 
 @router.get("/recent")
-def recent_uploads(limit: int = 20) -> list[dict[str, Any]]:
+def recent_uploads(*, limit: int = 20, current_user: CurrentUser) -> list[dict[str, Any]]:
     limit = max(1, min(limit, 100))
     with session_scope() as s:
         rows = (
-            s.execute(select(Upload).order_by(desc(Upload.uploaded_at)).limit(limit))
+            s.execute(
+                select(Upload)
+                .where(Upload.user_id == current_user.id)
+                .order_by(desc(Upload.uploaded_at))
+                .limit(limit)
+            )
             .scalars()
             .all()
         )
@@ -92,9 +104,19 @@ def recent_uploads(limit: int = 20) -> list[dict[str, Any]]:
 
 
 @router.get("/preview_cached")
-def preview_cached(sha16: str, sheet: str | None = None) -> dict[str, Any]:
-    key = _preview_cache_key(sha16, sheet)
+def preview_cached(
+    sha16: str,
+    sheet: str | None = None,
+    *,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
+    user_id = str(current_user.id)
+    key = _preview_cache_key(sha16, sheet, user_id)
     cached = redis_sync.get(key)
+    if not cached:
+        suffix = f":{sheet}" if sheet else ""
+        legacy_key = f"dawn:dev:preview:{sha16}{suffix}"
+        cached = redis_sync.get(legacy_key)
     if not cached:
         raise HTTPException(404, f"No cached preview for digest={sha16} sheet={sheet!r}")
     import json
@@ -105,11 +127,21 @@ def preview_cached(sha16: str, sheet: str | None = None) -> dict[str, Any]:
 
 
 @router.delete("/preview_cached")
-def delete_preview_cached(sha16: str, sheet: str | None = None) -> dict[str, Any]:
-    key = _preview_cache_key(sha16, sheet)
+def delete_preview_cached(
+    sha16: str,
+    sheet: str | None = None,
+    *,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
+    user_id = str(current_user.id)
+    key = _preview_cache_key(sha16, sheet, user_id)
     removed = bool(redis_sync.delete(key))
+    if not removed:
+        suffix = f":{sheet}" if sheet else ""
+        legacy_key = f"dawn:dev:preview:{sha16}{suffix}"
+        removed = bool(redis_sync.delete(legacy_key))
     with session_scope() as s:
-        stmt = select(Upload).where(Upload.sha16 == sha16)
+        stmt = select(Upload).where(Upload.sha16 == sha16, Upload.user_id == current_user.id)
         if sheet:
             stmt = stmt.where(Upload.sheet == sheet)
         rows = s.execute(stmt).scalars().all()
@@ -121,12 +153,16 @@ def delete_preview_cached(sha16: str, sheet: str | None = None) -> dict[str, Any
 
 
 @router.delete("/preview_cached/all")
-def delete_all_cached_previews() -> dict[str, Any]:
+def delete_all_cached_previews(
+    current_user: CurrentUser,
+) -> dict[str, Any]:
     removed = 0
-    keys = list(redis_sync.scan_iter(match="dawn:dev:preview:*"))
+    user_id = str(current_user.id)
+    pattern = f"dawn:dev:preview:{user_id}:*"
+    keys = list(redis_sync.scan_iter(match=pattern))
     if keys:
         removed = redis_sync.delete(*keys)
     with session_scope() as s:
-        result = s.execute(delete(Upload))
-        deleted_rows = result.rowcount or 0
+        result = s.execute(delete(Upload).where(Upload.user_id == current_user.id))
+    deleted_rows = result.rowcount or 0
     return {"ok": True, "cache_removed": removed, "deleted_records": deleted_rows}

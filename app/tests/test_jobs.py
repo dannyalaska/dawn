@@ -6,6 +6,8 @@ import pandas as pd
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from app.core.auth import ensure_default_user
+
 
 def _ingest_feed(client: TestClient) -> None:
     df = pd.DataFrame(
@@ -91,8 +93,16 @@ def test_job_run_endpoint_creates_run_record():
     assert payload["run"]["status"] == "success"
     assert payload["run"]["rows_out"] == 2
 
+    user_ctx = ensure_default_user()
     with session_scope() as session:
         job = session.get(Job, job_id)
         assert job is not None
-        runs = session.execute(select(JobRun).where(JobRun.job_id == job.id)).scalars().all()
+        assert job.user_id == user_ctx.id
+        runs = (
+            session.execute(
+                select(JobRun).where(JobRun.job_id == job.id, JobRun.user_id == user_ctx.id)
+            )
+            .scalars()
+            .all()
+        )
         assert len(runs) == 1

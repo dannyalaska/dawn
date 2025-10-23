@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
+from app.core.auth import CurrentUser
 from app.core.db import session_scope
 from app.core.models import Feed, Transform, TransformVersion
 from app.core.transforms import (
@@ -41,7 +42,9 @@ class TransformDryRunRequest(BaseModel):
 
 
 @router.post("", response_model=TransformUpsertResponse)
-def create_transform(payload: TransformUpsertRequest) -> TransformUpsertResponse:
+def create_transform(
+    payload: TransformUpsertRequest, current_user: CurrentUser
+) -> TransformUpsertResponse:
     definition = payload.definition
     python_code = generate_python_script(definition)
     dbt_model = generate_dbt_model(definition)
@@ -64,7 +67,12 @@ def create_transform(payload: TransformUpsertRequest) -> TransformUpsertResponse
 
     with session_scope() as s:
         feed = (
-            s.execute(select(Feed).where(Feed.identifier == definition.feed_identifier))
+            s.execute(
+                select(Feed).where(
+                    Feed.identifier == definition.feed_identifier,
+                    Feed.user_id == current_user.id,
+                )
+            )
             .scalars()
             .first()
         )
@@ -72,13 +80,20 @@ def create_transform(payload: TransformUpsertRequest) -> TransformUpsertResponse
             raise HTTPException(404, f"Feed {definition.feed_identifier!r} not found")
 
         transform = (
-            s.execute(select(Transform).where(Transform.name == definition.name)).scalars().first()
+            s.execute(
+                select(Transform).where(
+                    Transform.name == definition.name, Transform.user_id == current_user.id
+                )
+            )
+            .scalars()
+            .first()
         )
         if transform is None:
             transform = Transform(
                 name=definition.name,
                 feed_id=feed.id,
                 description=definition.description,
+                user_id=current_user.id,
             )
             s.add(transform)
             s.flush()
@@ -103,6 +118,7 @@ def create_transform(payload: TransformUpsertRequest) -> TransformUpsertResponse
             script=python_code,
             dbt_model=dbt_model,
             dry_run_report=dry_run_report,
+            user_id=current_user.id,
         )
         s.add(version_record)
         s.flush()

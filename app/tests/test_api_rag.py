@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from io import BytesIO
 from typing import Any
 
@@ -9,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from app.core.auth import ensure_default_user
 from app.core.db import session_scope
 from app.core.models import Upload
 
@@ -52,8 +54,9 @@ def client():
 def test_rag_index_saves_summary_and_chunks(client, monkeypatch):
     captured: dict[str, Any] = {}
 
-    def fake_upsert(chunks):
+    def fake_upsert(chunks, user_id="default"):
         captured["chunks"] = chunks
+        captured["user_id"] = user_id
         return len(chunks)
 
     monkeypatch.setattr("app.api.rag.upsert_chunks", fake_upsert)
@@ -84,14 +87,23 @@ def test_rag_index_saves_summary_and_chunks(client, monkeypatch):
 
     # Summary chunk should exist (row_index == -1)
     assert captured["chunks"][0].row_index == -1
+    assert captured["chunks"][0].metadata.get("tags") is not None
     assert summary.get("insights")
     assert summary.get("relationships")
     assert summary.get("analysis_plan")
+    assert summary.get("tags")
 
     with session_scope() as s:
-        rec = s.execute(
-            select(Upload).filter_by(sha16=payload["sha16"], sheet="Sheet1")
-        ).scalar_one_or_none()
+        user_ctx = ensure_default_user()
+        rec = (
+            s.execute(
+                select(Upload)
+                .where(Upload.sha16 == payload["sha16"], Upload.sheet == "Sheet1")
+                .where(Upload.user_id == user_ctx.id)
+            )
+            .scalars()
+            .first()
+        )
         assert rec is not None
         assert rec.summary is not None
         assert rec.summary["metrics"][0]["values"]
@@ -108,10 +120,16 @@ def test_rag_query_and_answer(client, monkeypatch):
         }
     ]
 
-    monkeypatch.setattr("app.api.rag.search", lambda q, k=5: fake_hits)
+    monkeypatch.setattr("app.api.rag.search", lambda q, k=5, user_id="default": fake_hits)
     monkeypatch.setattr("app.api.rag.format_context", lambda hits: "context text")
     monkeypatch.setattr(
-        "app.api.rag.llm_answer", lambda q, ctx, hits: "Login has the most tickets."
+        "app.api.rag.run_chat",
+        lambda messages, k=5, user_id="default": {
+            "answer": "Login has the most tickets.",
+            "sources": fake_hits,
+            "messages": messages
+            + [{"role": "assistant", "content": "Login has the most tickets."}],
+        },
     )
 
     query_resp = client.get("/rag/query", params={"q": "test", "k": 5})
@@ -135,9 +153,18 @@ def test_rag_chat_appends_history(client, monkeypatch):
             "score": 0.1,
         }
     ]
-    monkeypatch.setattr("app.api.rag.search", lambda q, k=12: fake_hits)
-    monkeypatch.setattr("app.api.rag.format_context", lambda hits, limit_chars=2500: "ctx")
-    monkeypatch.setattr("app.api.rag.llm_answer", lambda q, ctx, hits: f"Answer to {q}")
+    monkeypatch.setattr("app.api.rag.search", lambda q, k=12, user_id="default": fake_hits)
+
+    def fake_run_chat(messages, k=12, user_id="default"):
+        question = messages[-1]["content"]
+        assistant = {"role": "assistant", "content": f"Answer to {question}"}
+        return {
+            "answer": assistant["content"],
+            "sources": fake_hits,
+            "messages": messages + [assistant],
+        }
+
+    monkeypatch.setattr("app.api.rag.run_chat", fake_run_chat)
 
     resp = client.post(
         "/rag/chat",
@@ -161,7 +188,9 @@ def test_context_endpoints(client, monkeypatch):
 
     fake_redis = rag_module.redis_sync
     doc_id = "manual0001"
-    key = rag_module._doc_key(doc_id)
+    user_ctx = ensure_default_user()
+    user_id = str(user_ctx.id)
+    key = rag_module._doc_key(user_id, doc_id)
     fake_redis.hset(
         key,
         mapping={
@@ -169,6 +198,16 @@ def test_context_endpoints(client, monkeypatch):
             "source": "demo:Sheet1",
             "row_index": "1",
             "type": "excel",
+            "user_id": user_id,
+            "metadata": json.dumps(
+                {
+                    "id": doc_id,
+                    "source": "demo:Sheet1",
+                    "row_index": 1,
+                    "type": "excel",
+                    "user_id": user_id,
+                }
+            ),
             rag_module.VEC_FIELD: b"",
         },
     )
@@ -269,7 +308,7 @@ def test_chat_uses_summary_metrics(client, monkeypatch):
     assert index_resp.status_code == 200, index_resp.text
 
     monkeypatch.setattr(
-        "app.api.rag.search",
+        "app.core.chat_graph.search",
         lambda *_args, **_kwargs: [
             {
                 "key": "resolver:summary",

@@ -1,6 +1,7 @@
 import fnmatch
 import pathlib
 import sys
+from contextlib import suppress
 from typing import Any
 
 import pytest
@@ -83,6 +84,7 @@ class _FakePipeline:
 def isolate_env(tmp_path, monkeypatch):
     # Point DB at temp sqlite, isolate from dev DB
     monkeypatch.setenv("POSTGRES_DSN", f"sqlite:///{tmp_path / 'test.sqlite3'}")
+    monkeypatch.setenv("LLM_PROVIDER", "stub")
 
     # Swap redis client with fake
     from app.core import redis_client as rc
@@ -104,11 +106,20 @@ def isolate_env(tmp_path, monkeypatch):
     rag_module.redis_sync = fake  # type: ignore[attr-defined]
     feed_ingest.redis_sync = fake  # type: ignore[attr-defined]
     nl2sql.redis_sync = fake  # type: ignore[attr-defined]
+    with suppress(AttributeError):
+        rag_module._get_vector_store.cache_clear()  # type: ignore[attr-defined]
+    with suppress(AttributeError):
+        rag_module._get_embeddings.cache_clear()  # type: ignore[attr-defined]
+    with suppress(AttributeError):
+        nl2sql._compiled_graph.cache_clear()  # type: ignore[attr-defined]
 
     # Re-create tables for this temp DB
     from app.core.db import Base, get_engine
 
     eng = get_engine()
     Base.metadata.create_all(bind=eng)
+    from app.core.auth import ensure_default_user
+
+    ensure_default_user()
     yield
     Base.metadata.drop_all(bind=eng)

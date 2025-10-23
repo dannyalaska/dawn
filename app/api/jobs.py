@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.core.auth import CurrentUser
 from app.core.orchestration import (
     JobError,
     create_job,
@@ -28,12 +29,12 @@ class JobCreateRequest(BaseModel):
 
 
 @router.get("")
-def jobs_index() -> dict[str, Any]:
-    return {"jobs": list_jobs()}
+def jobs_index(current_user: CurrentUser) -> dict[str, Any]:
+    return {"jobs": list_jobs(user_id=current_user.id)}
 
 
 @router.post("")
-def jobs_create(payload: JobCreateRequest) -> dict[str, Any]:
+def jobs_create(payload: JobCreateRequest, current_user: CurrentUser) -> dict[str, Any]:
     try:
         job = create_job(
             name=payload.name,
@@ -43,6 +44,7 @@ def jobs_create(payload: JobCreateRequest) -> dict[str, Any]:
             transform_version=payload.transform_version,
             schedule=payload.schedule,
             is_active=payload.is_active,
+            user_id=current_user.id,
         )
         # Add to scheduler if active and has schedule
         if payload.is_active and payload.schedule:
@@ -58,18 +60,19 @@ def jobs_create(payload: JobCreateRequest) -> dict[str, Any]:
 
 
 @router.get("/{job_id}")
-def job_detail(job_id: int) -> dict[str, Any]:
+def job_detail(job_id: int, current_user: CurrentUser) -> dict[str, Any]:
     try:
-        job = get_job(job_id)
+        job = get_job(job_id, user_id=current_user.id)
     except JobError as exc:
         raise HTTPException(404, str(exc)) from exc
     return job
 
 
 @router.post("/{job_id}/run")
-def job_run(job_id: int) -> dict[str, Any]:
+def job_run(job_id: int, current_user: CurrentUser) -> dict[str, Any]:
     """Manually trigger a job execution."""
     try:
+        get_job(job_id, user_id=current_user.id)
         result = execute_job(job_id)
     except JobError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -77,9 +80,10 @@ def job_run(job_id: int) -> dict[str, Any]:
 
 
 @router.post("/{job_id}/pause")
-def job_pause(job_id: int) -> dict[str, Any]:
+def job_pause(job_id: int, current_user: CurrentUser) -> dict[str, Any]:
     """Pause a scheduled job."""
     try:
+        get_job(job_id, user_id=current_user.id)
         scheduler = get_scheduler()
         scheduler.pause_job(job_id)
         return {"status": "paused", "job_id": job_id}
@@ -88,9 +92,10 @@ def job_pause(job_id: int) -> dict[str, Any]:
 
 
 @router.post("/{job_id}/resume")
-def job_resume(job_id: int) -> dict[str, Any]:
+def job_resume(job_id: int, current_user: CurrentUser) -> dict[str, Any]:
     """Resume a paused job."""
     try:
+        get_job(job_id, user_id=current_user.id)
         scheduler = get_scheduler()
         scheduler.resume_job(job_id)
         return {"status": "resumed", "job_id": job_id}
@@ -99,11 +104,19 @@ def job_resume(job_id: int) -> dict[str, Any]:
 
 
 @router.get("/scheduler/status")
-def scheduler_status() -> dict[str, Any]:
+def scheduler_status(current_user: CurrentUser) -> dict[str, Any]:
     """Get scheduler status and list of scheduled jobs."""
     try:
         scheduler = get_scheduler()
-        scheduled_jobs = scheduler.list_scheduled_jobs()
+        scheduled_jobs: list[dict[str, Any]] = []
+        for item in scheduler.list_scheduled_jobs():
+            try:
+                job = get_job(item["job_id"], user_id=current_user.id)
+            except JobError:
+                continue
+            enriched = dict(item)
+            enriched["name"] = job.get("name")
+            scheduled_jobs.append(enriched)
         return {
             "running": scheduler.scheduler.running,
             "scheduled_jobs": scheduled_jobs,

@@ -5,21 +5,29 @@ import os
 import re
 import textwrap
 from dataclasses import asdict, dataclass
-from typing import Any
+from functools import lru_cache
+from typing import Any, TypedDict, cast
 
-import requests
 import sqlglot
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langgraph.graph import END, StateGraph
 from sqlalchemy import select
 from sqlglot import exp
 
+from app.core.chat_models import StubChatModel, get_chat_model
+from app.core.config import settings
 from app.core.db import session_scope
-from app.core.llm import LLM_PROVIDER
 from app.core.models import Feed, FeedVersion, Transform, TransformVersion
 from app.core.rag import format_context, search
 from app.core.redis_client import redis_sync
 from app.core.transforms import TransformDefinition
 
 RECENT_KEY = "dawn:nl2sql:recent_questions"
+
+
+def _recent_key(user_id: str) -> str:
+    return f"{RECENT_KEY}:{user_id}"
 
 
 @dataclass(slots=True)
@@ -33,8 +41,8 @@ class TableManifest:
     kind: str = "feed"
 
 
-def _load_recent_questions(limit: int = 10) -> list[str]:
-    raw = redis_sync.get(RECENT_KEY)
+def _load_recent_questions(limit: int = 10, *, user_id: str) -> list[str]:
+    raw = redis_sync.get(_recent_key(user_id))
     if not raw:
         return []
     try:
@@ -46,10 +54,10 @@ def _load_recent_questions(limit: int = 10) -> list[str]:
     return [str(q) for q in data[:limit]]
 
 
-def _record_question(question: str, max_entries: int = 50) -> None:
-    current = _load_recent_questions(max_entries)
+def _record_question(question: str, *, user_id: str, max_entries: int = 50) -> None:
+    current = _load_recent_questions(max_entries, user_id=user_id)
     updated = [question] + [q for q in current if q != question]
-    redis_sync.set(RECENT_KEY, json.dumps(updated[:max_entries]))
+    redis_sync.set(_recent_key(user_id), json.dumps(updated[:max_entries]))
 
 
 def _manifest_from_feed(feed: Feed, version: FeedVersion) -> TableManifest:
@@ -149,9 +157,11 @@ def _recent_block(questions: list[str]) -> str:
     return "\n".join(f"- {q}" for q in questions)
 
 
-def _rag_block(question: str, k: int = 4) -> tuple[str, list[dict[str, Any]]]:
+def _rag_block(
+    question: str, k: int = 4, user_id: str = "default"
+) -> tuple[str, list[dict[str, Any]]]:
     try:
-        hits = search(question, k=k)
+        hits = search(question, k=k, user_id=user_id)
         context = format_context(hits, limit_chars=1800)
     except Exception as exc:  # noqa: BLE001
         hits = []
@@ -185,68 +195,29 @@ def _prompt(
     return guidance
 
 
-def _call_ollama(prompt: str) -> str:
-    model = os.getenv("OLLAMA_MODEL", "llama3.1")
-    try:
-        resp = requests.post(
-            "http://127.0.0.1:11434/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return str(data.get("response", "")).strip()
-    except Exception as exc:  # noqa: BLE001
-        return f"SELECT '-- ollama error: {exc}' AS error;"
+PROMPT_TEMPLATE = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You convert natural-language analytics questions into SQL. Return a single SQL "
+            "statement with no commentary, explanations, or markdown fences.",
+        ),
+        ("human", "{prompt}"),
+    ]
+)
 
 
-def _call_lmstudio(prompt: str) -> str:
-    base = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234").rstrip("/")
-    if not base.endswith("/v1"):
-        base = f"{base}/v1"
-    payload = {
-        "model": os.getenv("OPENAI_MODEL", "mistral-7b-instruct-v0.3"),
-        "messages": [
-            {"role": "system", "content": "Return SQL only."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.0,
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', 'lm-studio')}",
-    }
-    try:
-        resp = requests.post(f"{base}/chat/completions", json=payload, headers=headers, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
-            return "SELECT '-- lmstudio empty response' AS error;"
-        content = choices[0].get("message", {}).get("content", "")
-        return str(content).strip()
-    except Exception as exc:  # noqa: BLE001
-        return f"SELECT '-- lmstudio error: {exc}' AS error;"
-
-
-def _call_openai(prompt: str) -> str:
-    try:
-        from openai import OpenAI
-
-        client = OpenAI()
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "Return SQL only. No commentary."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-        )
-        content = resp.choices[0].message.content
-        return str(content).strip() if content else ""
-    except Exception as exc:  # noqa: BLE001
-        return f"SELECT '-- openai error: {exc}' AS error;"
+class NL2SQLState(TypedDict, total=False):
+    question: str
+    manifest: list[TableManifest]
+    recent: list[str]
+    rag_context: str
+    hits: list[dict[str, Any]]
+    prompt: str
+    raw_sql: str
+    sql: str
+    user_id: str
+    k: int
 
 
 def _call_stub(manifest: list[TableManifest]) -> str:
@@ -254,14 +225,63 @@ def _call_stub(manifest: list[TableManifest]) -> str:
     return f"SELECT * FROM {table} LIMIT 50;"
 
 
-def generate_sql(prompt: str, manifest: list[TableManifest]) -> str:
-    if LLM_PROVIDER == "ollama":
-        return _call_ollama(prompt)
-    if LLM_PROVIDER == "openai":
-        return _call_openai(prompt)
-    if LLM_PROVIDER == "lmstudio":
-        return _call_lmstudio(prompt)
-    return _call_stub(manifest)
+@lru_cache(maxsize=4)
+def _compiled_graph(provider: str) -> Any:
+    model = get_chat_model(provider)
+    parser = StrOutputParser()
+    graph = StateGraph(NL2SQLState)
+
+    def prep_node(state: NL2SQLState) -> dict[str, Any]:
+        k_value = cast(int, state.get("k", 4))
+        user_id = state.get("user_id", "default")
+        rag_context, hits = _rag_block(state["question"], k=k_value, user_id=user_id)
+        prompt = _prompt(state["question"], state["manifest"], state.get("recent", []), rag_context)
+        return {"rag_context": rag_context, "hits": hits, "prompt": prompt}
+
+    if isinstance(model, StubChatModel):
+
+        def llm_node(state: NL2SQLState) -> dict[str, Any]:
+            return {"raw_sql": _call_stub(state["manifest"])}
+
+    else:
+        chain = PROMPT_TEMPLATE | model | parser
+
+        def llm_node(state: NL2SQLState) -> dict[str, Any]:
+            try:
+                sql_text = chain.invoke({"prompt": state["prompt"]}).strip()
+            except Exception as exc:  # noqa: BLE001
+                sql_text = f"SELECT '-- llm error: {exc}' AS error;"
+            return {"raw_sql": sql_text}
+
+    def clean_node(state: NL2SQLState) -> dict[str, Any]:
+        return {"sql": _clean_sql(state.get("raw_sql", ""))}
+
+    graph.add_node("prep", prep_node)
+    graph.add_node("llm", llm_node)
+    graph.add_node("clean", clean_node)
+    graph.set_entry_point("prep")
+    graph.add_edge("prep", "llm")
+    graph.add_edge("llm", "clean")
+    graph.add_edge("clean", END)
+
+    return graph.compile()
+
+
+def _run_graph(
+    question: str, manifest: list[TableManifest], recent: list[str], *, user_id: str, k: int = 4
+) -> dict[str, Any]:
+    env_provider = os.getenv("LLM_PROVIDER")
+    provider = (env_provider or settings.LLM_PROVIDER or "stub").lower()
+    graph = _compiled_graph(provider)
+    return graph.invoke(
+        {
+            "question": question,
+            "manifest": manifest,
+            "recent": recent,
+            "user_id": user_id,
+            "k": k,
+        }
+    )
 
 
 def _clean_sql(sql_text: str) -> str:
@@ -305,7 +325,7 @@ def validate_sql(
     if len(statements) != 1:
         errors.append("Only a single SQL statement is allowed.")
 
-    statement = statements[0]
+    statement = cast(exp.Expression, statements[0])
     if (
         isinstance(statement, exp.Insert | exp.Update | exp.Delete | exp.Command)
         and not allow_writes
@@ -362,18 +382,21 @@ def nl_to_sql(
     allow_writes: bool = False,
     dialect: str = "postgres",
     explain: bool = False,
+    user_id: str = "default",
 ) -> dict[str, Any]:
     manifest = build_manifest(feed_identifiers)
-    recent = _load_recent_questions()
-    rag_context, hits = _rag_block(question)
-    prompt = _prompt(question, manifest, recent, rag_context)
-    raw_sql = generate_sql(prompt, manifest)
-    sql_text = _clean_sql(raw_sql)
+    recent = _load_recent_questions(user_id=user_id)
+    state = _run_graph(question, manifest, recent, user_id=user_id)
+    prompt = state.get("prompt") or _prompt(
+        question, manifest, recent, state.get("rag_context", "")
+    )
+    sql_text = state.get("sql") or _clean_sql(state.get("raw_sql", ""))
+    hits = state.get("hits", [])
     validation = validate_sql(sql_text, manifest, allow_writes=allow_writes, dialect=dialect)
     explain_plan = explain_stub(sql_text, dialect) if explain and validation.get("ok") else None
 
     if validation.get("ok"):
-        _record_question(question)
+        _record_question(question, user_id=user_id)
 
     return {
         "sql": sql_text,

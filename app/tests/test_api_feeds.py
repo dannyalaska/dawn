@@ -5,6 +5,8 @@ from io import BytesIO
 import pandas as pd
 from fastapi.testclient import TestClient
 
+from app.core.auth import ensure_default_user
+
 
 def _csv_bytes() -> bytes:
     df = pd.DataFrame(
@@ -54,12 +56,18 @@ def test_feed_ingest_upload_creates_version_and_summary():
     assert drift["status"] in {"baseline", "no_change", "changed"}
 
     # DB persisted
+    user_ctx = ensure_default_user()
+
     with session_scope() as s:
-        feed = s.query(Feed).filter(Feed.identifier == "tickets").one()
+        feed = s.query(Feed).filter(Feed.identifier == "tickets", Feed.user_id == user_ctx.id).one()
         assert feed.name == "Tickets"
         version = (
             s.query(FeedVersion)
-            .filter(FeedVersion.feed_id == feed.id, FeedVersion.version == 1)
+            .filter(
+                FeedVersion.feed_id == feed.id,
+                FeedVersion.version == 1,
+                FeedVersion.user_id == user_ctx.id,
+            )
             .one()
         )
         assert version.row_count == 3
@@ -73,7 +81,7 @@ def test_feed_ingest_upload_creates_version_and_summary():
         assert dq_rules
         assert any(rule.rule_type == "row_count_min" for rule in dq_rules)
 
-    redis_key = "dawn:feed:tickets:v1"
+    redis_key = f"dawn:user:{user_ctx.id}:feed:tickets:v1"
     stored = redis_sync.hgetall(redis_key)
     assert stored
     assert "summary_markdown" in stored

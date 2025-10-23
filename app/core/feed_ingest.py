@@ -96,11 +96,14 @@ def _fetch_http_bytes(url: str | None) -> bytes:
     return resp.content
 
 
-def _collect_existing_columns(exclude_identifier: str | None) -> list[dict[str, str]]:
+def _collect_existing_columns(
+    exclude_identifier: str | None, *, user_id: int
+) -> list[dict[str, str]]:
     with session_scope() as s:
         stmt = (
             select(Feed.identifier, FeedVersion.schema_)
             .join(FeedVersion, Feed.id == FeedVersion.feed_id)
+            .where(Feed.user_id == user_id)
             .order_by(FeedVersion.created_at.desc())
         )
         rows = s.execute(stmt).all()
@@ -357,9 +360,9 @@ def _mermaid_er(
 
 
 def _persist_schema_to_redis(
-    identifier: str, version: int, payload: dict[str, Any], markdown: str
+    identifier: str, version: int, payload: dict[str, Any], markdown: str, *, user_id: int
 ) -> None:
-    key = f"dawn:feed:{identifier}:v{version}"
+    key = f"dawn:user:{user_id}:feed:{identifier}:v{version}"
     redis_sync.hset(
         key,
         mapping={
@@ -369,13 +372,21 @@ def _persist_schema_to_redis(
     )
 
 
-def _chunk_summary(identifier: str, version: int, markdown: str) -> None:
+def _chunk_summary(identifier: str, version: int, markdown: str, *, user_id: int) -> None:
     chunks: list[Chunk] = []
     source = f"feed:{identifier}:v{version}"
     for piece in simple_chunker(markdown, max_chars=900, overlap=120):
-        chunks.append(Chunk(text=piece, source=source, row_index=-1, chunk_type="schema"))
+        chunks.append(
+            Chunk(
+                text=piece,
+                source=source,
+                row_index=-1,
+                chunk_type="schema",
+                metadata={"tags": ["feed", identifier]},
+            )
+        )
     if chunks:
-        upsert_chunks(chunks)
+        upsert_chunks(chunks, user_id=str(user_id))
 
 
 def _build_manifest(
@@ -518,6 +529,7 @@ def ingest_feed(
     sheet: str | None,
     s3_path: str | None,
     http_url: str | None,
+    user_id: int,
 ) -> dict[str, Any]:
     kind = _ensure_kind(source_kind)
     inferred_format = _infer_format(filename, data_format)
@@ -559,7 +571,7 @@ def ingest_feed(
 
     columns_schema, primary_keys = _columns_schema(sample_df)
     col_count = int(len(sample_df.columns))
-    existing_columns = _collect_existing_columns(identifier)
+    existing_columns = _collect_existing_columns(identifier, user_id=user_id)
     foreign_keys = _infer_foreign_keys(columns_schema, existing_columns, identifier)
 
     summary_text, column_summaries, metrics, extras = summarize_dataframe(sample_df)
@@ -622,7 +634,11 @@ def ingest_feed(
     digest = sha256(raw_bytes).hexdigest()[:16]
 
     with session_scope() as s:
-        feed = s.execute(select(Feed).where(Feed.identifier == identifier)).scalars().first()
+        feed = (
+            s.execute(select(Feed).where(Feed.identifier == identifier, Feed.user_id == user_id))
+            .scalars()
+            .first()
+        )
         if feed is None:
             feed = Feed(
                 identifier=identifier,
@@ -635,6 +651,7 @@ def ingest_feed(
                     "s3_path": s3_path,
                     "http_url": http_url,
                 },
+                user_id=user_id,
             )
             s.add(feed)
             s.flush()
@@ -688,6 +705,7 @@ def ingest_feed(
                 summary_json=summary_payload,
                 row_count=row_count,
                 column_count=col_count,
+                user_id=user_id,
             )
             s.add(feed_version)
             drift_payload = _compute_drift(schema_payload, profile_payload, previous_version)
@@ -715,6 +733,7 @@ def ingest_feed(
         feed_version.row_count = row_count
         feed_version.column_count = col_count
         feed_version.sha16 = digest
+        feed_version.user_id = user_id
 
         if er_diagram:
             summary_payload["mermaid"] = er_diagram
@@ -724,11 +743,13 @@ def ingest_feed(
 
     # Persist summary to Redis & RAG
     try:
-        _persist_schema_to_redis(identifier, version_number, summary_payload, markdown_doc)
+        _persist_schema_to_redis(
+            identifier, version_number, summary_payload, markdown_doc, user_id=user_id
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"[feed-ingest] redis persist failed: {exc}")
     try:
-        _chunk_summary(identifier, version_number, markdown_doc)
+        _chunk_summary(identifier, version_number, markdown_doc, user_id=user_id)
     except Exception as exc:  # noqa: BLE001
         print(f"[feed-ingest] chunk embedding failed: {exc}")
 

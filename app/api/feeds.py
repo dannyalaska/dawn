@@ -7,6 +7,7 @@ from fastapi import File as UploadFileParam
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from app.core.auth import CurrentUser
 from app.core.db import session_scope
 from app.core.feed_ingest import FeedIngestError, ingest_feed
 from app.core.models import Feed, FeedVersion
@@ -28,6 +29,8 @@ async def feed_ingest(
     s3_path: str | None = Form(default=None),
     http_url: str | None = Form(default=None),
     file: UploadFile | None = upload_file_param,
+    *,
+    current_user: CurrentUser,
 ) -> dict[str, Any]:
     try:
         file_bytes = await file.read() if file is not None else None
@@ -46,6 +49,7 @@ async def feed_ingest(
             sheet=sheet,
             s3_path=s3_path,
             http_url=http_url,
+            user_id=current_user.id,
         )
     except FeedIngestError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -96,15 +100,21 @@ def _serialize_feed(feed: Feed, latest: FeedVersion | None) -> dict[str, Any]:
 
 
 @router.get("")
-def feeds_index() -> dict[str, Any]:
+def feeds_index(current_user: CurrentUser) -> dict[str, Any]:
     feeds: list[dict[str, Any]] = []
     with session_scope() as session:
-        feed_rows = session.execute(select(Feed).order_by(Feed.created_at.asc())).scalars().all()
+        feed_rows = (
+            session.execute(
+                select(Feed).where(Feed.user_id == current_user.id).order_by(Feed.created_at.asc())
+            )
+            .scalars()
+            .all()
+        )
         for feed in feed_rows:
             latest = (
                 session.execute(
                     select(FeedVersion)
-                    .where(FeedVersion.feed_id == feed.id)
+                    .where(FeedVersion.feed_id == feed.id, FeedVersion.user_id == current_user.id)
                     .order_by(FeedVersion.version.desc())
                     .limit(1)
                 )
@@ -116,10 +126,14 @@ def feeds_index() -> dict[str, Any]:
 
 
 @router.get("/{identifier}")
-def feed_detail(identifier: str) -> dict[str, Any]:
+def feed_detail(identifier: str, current_user: CurrentUser) -> dict[str, Any]:
     with session_scope() as session:
         feed = (
-            session.execute(select(Feed).where(Feed.identifier == identifier.strip()))
+            session.execute(
+                select(Feed).where(
+                    Feed.identifier == identifier.strip(), Feed.user_id == current_user.id
+                )
+            )
             .scalars()
             .first()
         )
@@ -128,7 +142,7 @@ def feed_detail(identifier: str) -> dict[str, Any]:
         versions = (
             session.execute(
                 select(FeedVersion)
-                .where(FeedVersion.feed_id == feed.id)
+                .where(FeedVersion.feed_id == feed.id, FeedVersion.user_id == current_user.id)
                 .order_by(FeedVersion.version.desc())
             )
             .scalars()
@@ -159,14 +173,22 @@ class FavoriteRequest(BaseModel):
 
 
 @router.post("/{identifier}/favorite")
-def feed_favorite(identifier: str, payload: FavoriteRequest) -> dict[str, Any]:
+def feed_favorite(
+    identifier: str,
+    payload: FavoriteRequest,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
     sheet = payload.sheet.strip()
     if not sheet:
         raise HTTPException(400, "Sheet name is required")
 
     with session_scope() as session:
         feed = (
-            session.execute(select(Feed).where(Feed.identifier == identifier.strip()))
+            session.execute(
+                select(Feed).where(
+                    Feed.identifier == identifier.strip(), Feed.user_id == current_user.id
+                )
+            )
             .scalars()
             .first()
         )
@@ -181,7 +203,7 @@ def feed_favorite(identifier: str, payload: FavoriteRequest) -> dict[str, Any]:
         latest = (
             session.execute(
                 select(FeedVersion)
-                .where(FeedVersion.feed_id == feed.id)
+                .where(FeedVersion.feed_id == feed.id, FeedVersion.user_id == current_user.id)
                 .order_by(FeedVersion.version.desc())
                 .limit(1)
             )

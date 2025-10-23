@@ -14,9 +14,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from redis.exceptions import ResponseError
 from sqlalchemy import select
 
+from app.core.auth import CurrentUser
+from app.core.chat_graph import run_chat
 from app.core.db import session_scope
 from app.core.excel.summary import summarize_dataframe
-from app.core.llm import answer as llm_answer
 from app.core.models import Upload
 from app.core.rag import (
     Chunk,
@@ -42,6 +43,8 @@ async def index_excel(
     sheet: str | None = FQuery(default=None),
     chunk_max_chars: int = FQuery(default=600, ge=128, le=2000),
     chunk_overlap: int = FQuery(default=80, ge=0, le=600),
+    *,
+    current_user: CurrentUser,
 ) -> dict:
     name = file.filename or "upload.xlsx"
     data = await file.read()
@@ -83,19 +86,76 @@ async def index_excel(
         if values_preview:
             summary_lines.append(f"{metric.description or metric.column}: {values_preview}")
     combined_summary = "\n".join(summary_lines)
+
+    def _infer_dataset_tags() -> list[str]:
+        tags: set[str] = set()
+        names = [cs.name.lower() for cs in column_summaries]
+        if any("lat" in n for n in names) and any(
+            kw in n for kw in ("lon", "lng", "long") for n in names
+        ):
+            tags.add("geospatial")
+        if any("address" in n or "city" in n or "zip" in n for n in names):
+            tags.add("location")
+        if any("date" in n or "time" in n or "timestamp" in n for n in names):
+            tags.add("temporal")
+        if any("amount" in n or "revenue" in n or "cost" in n for n in names):
+            tags.add("financial")
+        if any("status" in n or "state" in n for n in names):
+            tags.add("status-tracking")
+        if any("ticket" in n for n in names):
+            tags.add("records")
+        return sorted(tags)
+
+    dataset_tags = _infer_dataset_tags()
+
     chunks: list[Chunk] = []
     src = f"{name}:{actual_sheet}"
     if combined_summary:
         for piece in simple_chunker(combined_summary, max_chars=900, overlap=0):
             chunks.append(
-                Chunk(text=f"Summary for {src}: {piece}", source=f"{src}:summary", row_index=-1)
+                Chunk(
+                    text=f"Summary for {src}: {piece}",
+                    source=f"{src}:summary",
+                    row_index=-1,
+                    chunk_type="summary",
+                    metadata={"tags": dataset_tags},
+                )
             )
+
+    for column in column_summaries:
+        details: list[str] = [f"Column {column.name} (dtype {column.dtype})."]
+        if column.top_values:
+            sample = ", ".join(f"{label} ({count})" for label, count in column.top_values[:5])
+            details.append(f"Top values: {sample}.")
+        if column.stats:
+            stats = ", ".join(f"{k}={v:.2f}" for k, v in column.stats.items())
+            details.append(f"Stats: {stats}.")
+        column_tags = dataset_tags + [f"column:{column.name.lower()}"]
+        chunks.append(
+            Chunk(
+                text=" ".join(details),
+                source=f"{src}:column:{column.name}",
+                row_index=-1,
+                chunk_type="column_profile",
+                metadata={"column_name": column.name, "tags": column_tags, "dtype": column.dtype},
+            )
+        )
+
     for i, row in df_text.iterrows():
         row_text = " | ".join(f"{col}: {row[col]}" for col in df_text.columns)
         for piece in simple_chunker(row_text, max_chars=chunk_max_chars, overlap=chunk_overlap):
-            chunks.append(Chunk(text=piece, source=src, row_index=int(i)))
+            chunks.append(
+                Chunk(
+                    text=piece,
+                    source=src,
+                    row_index=int(i),
+                    chunk_type="sample_row",
+                    metadata={"tags": dataset_tags},
+                )
+            )
 
-    n = upsert_chunks(chunks)
+    user_id = str(current_user.id)
+    n = upsert_chunks(chunks, user_id=user_id)
 
     summary_payload = {
         "text": combined_summary,
@@ -121,6 +181,7 @@ async def index_excel(
         "aggregates": summary_extras.get("aggregates", []),
         "relationships": summary_extras.get("relationships", {}),
         "analysis_plan": summary_extras.get("plan", []),
+        "tags": dataset_tags,
     }
 
     size_bytes = len(data)
@@ -130,7 +191,11 @@ async def index_excel(
     with session_scope() as s:
         stmt = (
             select(Upload)
-            .where(Upload.sha16 == digest, Upload.sheet == actual_sheet)
+            .where(
+                Upload.sha16 == digest,
+                Upload.sheet == actual_sheet,
+                Upload.user_id == current_user.id,
+            )
             .order_by(Upload.uploaded_at.desc())
             .limit(1)
         )
@@ -140,6 +205,7 @@ async def index_excel(
             existing.rows = row_count
             existing.cols = col_count
             existing.size_bytes = size_bytes
+            existing.user_id = current_user.id
         else:
             s.add(
                 Upload(
@@ -149,6 +215,7 @@ async def index_excel(
                     size_bytes=size_bytes,
                     rows=row_count,
                     cols=col_count,
+                    user_id=current_user.id,
                     summary=summary_payload,
                 )
             )
@@ -195,179 +262,19 @@ class MemoryUpdateRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-def _source_to_file_sheet(source: str) -> tuple[str, str] | None:
-    base = source
-    if base.endswith(":summary"):
-        base = base.rsplit(":", 1)[0]
-    parts = base.split(":", 1)
-    if len(parts) != 2:
-        return None
-    return parts[0], parts[1]
-
-
-def _load_summary_for_source(source: str) -> dict[str, Any] | None:
-    parsed = _source_to_file_sheet(source)
-    if not parsed:
-        return None
-    filename, sheet = parsed
-    with session_scope() as s:
-        stmt = (
-            select(Upload)
-            .where(Upload.filename == filename, Upload.sheet == sheet)
-            .order_by(Upload.uploaded_at.desc())
-            .limit(1)
-        )
-        rec = s.execute(stmt).scalars().first()
-        if rec and rec.summary:
-            return dict(rec.summary)
-    return None
-
-
-_MOST_KEYWORDS = ("most", "highest", "largest", "top", "greatest")
-_LEAST_KEYWORDS = ("fewest", "least", "lowest", "smallest")
-_FAST_KEYWORDS = ("fastest", "quickest", "shortest", "lowest", "best")
-_SLOW_KEYWORDS = ("slowest", "longest", "highest", "worst")
-
-
-def _match_column(
-    question_lower: str, insights: dict[str, Any], relationships: dict[str, str]
-) -> str | None:
-    for col, role in relationships.items():
-        role_lower = (role or "").lower()
-        col_lower = col.lower()
-        if role_lower and role_lower in question_lower:
-            return col
-        if col_lower in question_lower:
-            return col
-    for col in insights:
-        if col.lower() in question_lower:
-            return col
-    # resolver-specific fallback
-    if any(word in question_lower for word in ("ticket", "resolve", "assigned", "who")):
-        for col, role in relationships.items():
-            if (role or "").lower() in {"resolver", "owner", "assignee", "agent"}:
-                return col
-    return None
-
-
-def _direct_answer_from_summary(question: str, summary: dict[str, Any]) -> str | None:
-    q = question.lower()
-    insights = summary.get("insights") or {}
-    relationships = {str(k): str(v) for k, v in (summary.get("relationships") or {}).items()}
-    aggregates = summary.get("aggregates") or []
-
-    # Count-based questions (most / fewest)
-    if insights and any(keyword in q for keyword in _MOST_KEYWORDS + _LEAST_KEYWORDS):
-        column = _match_column(q, insights, relationships)
-        if column and column in insights:
-            entries = insights.get(column) or []
-            if entries:
-                descending = not any(keyword in q for keyword in _LEAST_KEYWORDS)
-                descriptor = "most" if descending else "fewest"
-                sorted_entries = sorted(entries, key=lambda e: int(e.get("count", 0)), reverse=True)
-                if not descending:
-                    sorted_entries = list(reversed(sorted_entries))
-                top_entry = sorted_entries[0]
-                others = ", ".join(
-                    f"{entry['label']} ({entry['count']})" for entry in sorted_entries[1:3]
-                )
-                headline = (
-                    f"{top_entry['label']} handled the {descriptor} tickets ({top_entry['count']})."
-                )
-                if others:
-                    headline += f" Next: {others}."
-                return headline
-
-    # Aggregate-based questions (fastest / slowest)
-    target: str | None = None
-    speed_descriptor: str | None = None
-    if any(keyword in q for keyword in _FAST_KEYWORDS):
-        target = "best"
-        speed_descriptor = "fastest"
-    elif any(keyword in q for keyword in _SLOW_KEYWORDS):
-        target = "worst"
-        speed_descriptor = "slowest"
-
-    if target and aggregates:
-        for agg in aggregates:
-            group = str(agg.get("group", ""))
-            value = str(agg.get("value", ""))
-            role = (relationships.get(group) or "").lower()
-            if not group:
-                continue
-            if group.lower() in q or (role and role in q) or (role == "resolver" and "ticket" in q):
-                entries = agg.get(target) or []
-                if entries:
-                    entry = entries[0]
-                    metric_value = entry.get("value")
-                    if isinstance(metric_value, (int | float)):
-                        value_str = f"{metric_value:.2f}"
-                    else:
-                        value_str = str(metric_value)
-                    value_name = str(value or "metric")
-                    nice_value = value_name.replace("_", " ")
-                    descriptor_label = speed_descriptor or "fastest"
-                    answer = f"{entry.get('label')} is the {descriptor_label} for {nice_value} ({value_str})."
-                    peers = ", ".join(
-                        (
-                            f"{e['label']} ({e['value']:.2f})"
-                            if isinstance(e.get("value"), (int | float))
-                            else f"{e['label']} ({e.get('value')})"
-                        )
-                        for e in entries[1:3]
-                    )
-                    if peers:
-                        answer += f" Next: {peers}."
-                    return answer
-
-    return None
-
-
 @router.post("/chat")
-def rag_chat(payload: ChatRequest) -> dict[str, Any]:
-    if payload.messages[-1].role != "user":
-        raise HTTPException(400, "Last message must be from the user.")
-
-    question = payload.messages[-1].content
-    hits = search(question, k=payload.k)
-    ctx = format_context(hits, limit_chars=2500)
-
-    summary_payload: dict[str, Any] | None = None
-    direct_answer: str | None = None
-    for hit in hits:
-        summary_payload = _load_summary_for_source(hit.get("source", ""))
-        if summary_payload:
-            direct_answer = _direct_answer_from_summary(question, summary_payload)
-            if direct_answer:
-                break
-
-    history_lines = [f"{msg.role.capitalize()}: {msg.content}" for msg in payload.messages[:-1]]
-    if history_lines:
-        history_block = "\n".join(history_lines)
-        ctx = f"Conversation so far:\n{history_block}\n\nRetrieved data:\n{ctx}"
-
-    if direct_answer:
-        answer_text = direct_answer
-    else:
-        answer_text = (
-            llm_answer(question, ctx, hits)
-            if hits
-            else (
-                "I don't have enough context yet. Try indexing more data or restating the question."
-            )
-        )
-
-    updated_messages = payload.messages + [ChatMessage(role="assistant", content=answer_text)]
-    return {
-        "answer": answer_text,
-        "sources": hits,
-        "messages": [m.model_dump() for m in updated_messages],
-    }
+def rag_chat(payload: ChatRequest, current_user: CurrentUser) -> dict[str, Any]:
+    message_dicts = [msg.model_dump() for msg in payload.messages]
+    try:
+        result = run_chat(message_dicts, k=payload.k, user_id=str(current_user.id))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return result
 
 
 @router.get("/query")
-def rag_query(q: str, k: int = 5) -> dict:
-    hits = search(q, k=k)
+def rag_query(q: str, *, k: int = 5, current_user: CurrentUser) -> dict:
+    hits = search(q, k=k, user_id=str(current_user.id))
     ctx = format_context(hits)
     # Placeholder generator; plug in your LLM later.
     answer = (
@@ -380,12 +287,15 @@ def rag_query(q: str, k: int = 5) -> dict:
 
 @router.get("/context")
 def list_context(
-    source: str = FQuery(...), limit: int = FQuery(default=200, ge=1, le=500)
+    source: str = FQuery(...),
+    limit: int = FQuery(default=200, ge=1, le=500),
+    *,
+    current_user: CurrentUser,
 ) -> dict[str, Any]:
     source_clean = source.strip()
     if not source_clean:
         raise HTTPException(400, "source must be provided")
-    notes = list_context_chunks(source=source_clean, limit=limit)
+    notes = list_context_chunks(user_id=str(current_user.id), source=source_clean, limit=limit)
     return {
         "source": source_clean,
         "count": len(notes),
@@ -395,35 +305,43 @@ def list_context(
 
 
 @router.put("/context/{chunk_id}")
-def update_context(chunk_id: str, payload: ContextUpdateRequest) -> dict[str, Any]:
+def update_context(
+    chunk_id: str,
+    payload: ContextUpdateRequest,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
     text = payload.text.strip()
     if not text:
         raise HTTPException(400, "text cannot be empty")
     try:
-        updated = update_context_chunk(chunk_id, text)
+        updated = update_context_chunk(str(current_user.id), chunk_id, text)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     return {"updated": updated}
 
 
 @router.post("/context/note")
-def add_context(payload: ContextNoteRequest) -> dict[str, Any]:
+def add_context(payload: ContextNoteRequest, current_user: CurrentUser) -> dict[str, Any]:
     source = payload.source.strip()
     text = payload.text.strip()
     if not source:
         raise HTTPException(400, "source cannot be empty")
     if not text:
         raise HTTPException(400, "text cannot be empty")
-    created = add_manual_note(source, text)
+    created = add_manual_note(str(current_user.id), source, text)
     return {"created": created}
 
 
 @router.get("/memory")
-def get_memory(sha16: str, sheet: str) -> dict[str, Any]:
+def get_memory(sha16: str, sheet: str, current_user: CurrentUser) -> dict[str, Any]:
     with session_scope() as s:
         stmt = (
             select(Upload)
-            .where(Upload.sha16 == sha16, Upload.sheet == sheet)
+            .where(
+                Upload.sha16 == sha16,
+                Upload.sheet == sheet,
+                Upload.user_id == current_user.id,
+            )
             .order_by(Upload.uploaded_at.desc())
             .limit(1)
         )
@@ -442,11 +360,15 @@ def get_memory(sha16: str, sheet: str) -> dict[str, Any]:
 
 
 @router.put("/memory")
-def update_memory(payload: MemoryUpdateRequest) -> dict[str, Any]:
+def update_memory(payload: MemoryUpdateRequest, current_user: CurrentUser) -> dict[str, Any]:
     with session_scope() as s:
         stmt = (
             select(Upload)
-            .where(Upload.sha16 == payload.sha16, Upload.sheet == payload.sheet)
+            .where(
+                Upload.sha16 == payload.sha16,
+                Upload.sheet == payload.sheet,
+                Upload.user_id == current_user.id,
+            )
             .order_by(Upload.uploaded_at.desc())
             .limit(1)
         )
@@ -469,17 +391,19 @@ def update_memory(payload: MemoryUpdateRequest) -> dict[str, Any]:
         }
 
 
-def _ans_cache_key(q: str, keys: list[str]) -> str:
+def _ans_cache_key(q: str, keys: list[str], user_id: str) -> str:
     m = hashlib.sha1()
     m.update(q.encode("utf-8"))
     for k in keys:
         m.update(k.encode("utf-8"))
-    return f"dawn:ans:{m.hexdigest()}"
+    m.update(user_id.encode("utf-8"))
+    return f"dawn:ans:{user_id}:{m.hexdigest()}"
 
 
 @router.get("/answer")
-def rag_answer(q: str, k: int = 5) -> dict:
-    hits = search(q, k=k)
+def rag_answer(q: str, *, k: int = 5, current_user: CurrentUser) -> dict:
+    user_id = str(current_user.id)
+    hits = search(q, k=k, user_id=user_id)
     if not hits:
         return {
             "query": q,
@@ -487,18 +411,24 @@ def rag_answer(q: str, k: int = 5) -> dict:
             "sources": [],
         }
 
-    # Cache by query + retrieved doc keys
     key_list = [h["key"] for h in hits]
-    ck = _ans_cache_key(q, key_list)
+    ck = _ans_cache_key(q, key_list, user_id)
     cached = redis_sync.get(ck)
     if cached:
         return json.loads(cached)
 
-    ctx = format_context(hits)
-    ans = llm_answer(q, ctx, hits)
-    out: dict[str, Any] = {"query": q, "answer": ans, "sources": hits}
-    redis_sync.setex(ck, 900, json.dumps(out))  # 15-minute TTL
-    return out
+    try:
+        result = run_chat([{"role": "user", "content": q}], k=k, user_id=user_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    response: dict[str, Any] = {
+        "query": q,
+        "answer": result.get("answer", ""),
+        "sources": result.get("sources", []),
+    }
+    redis_sync.setex(ck, 900, json.dumps(response))
+    return response
 
 
 @router.get("/ping")

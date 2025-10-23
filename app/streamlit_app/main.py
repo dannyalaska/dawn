@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 import requests
@@ -37,7 +38,16 @@ STATE_DEFAULTS: dict[str, Any] = {
     "context_source": None,
     "chunk_config": {"max_chars": 600, "overlap": 80, "top_k": 6},
     "last_prompt": "",
+    "auth_token": None,
+    "user": None,
+    "auth_error": None,
+    "backend_cache": None,
 }
+
+
+def _rerun() -> None:
+    cast(Any, st).experimental_rerun()
+
 
 LLM_OPTIONS = [
     ("stub", "Offline / Stub"),
@@ -61,17 +71,20 @@ class ServiceStatus:
 
 def main() -> None:
     _init_state()
+    _ensure_authenticated()
     health = _fetch_health()
     _render_sidebar(health)
     _render_header()
 
-    tabs = st.tabs(["Upload & Preview", "Context & Memory", "Ask Dawn"])
+    tabs = st.tabs(["Upload & Preview", "Context & Memory", "Ask Dawn", "Backend Settings"])
     with tabs[0]:
         _render_preview_tab()
     with tabs[1]:
         _render_context_tab()
     with tabs[2]:
         _render_ask_tab()
+    with tabs[3]:
+        _render_backend_settings_tab()
 
 
 def _init_state() -> None:
@@ -101,6 +114,8 @@ def _render_header() -> None:
 
 def _render_sidebar(health: dict[str, Any] | None) -> None:
     with st.sidebar:
+        _render_account_panel()
+        st.divider()
         st.subheader("Connection status")
         for status in _service_statuses(health):
             badge = (
@@ -192,6 +207,83 @@ def _render_llm_settings() -> None:
         _persist_env_vars(updates)
         st.session_state["llm_provider"] = provider_choice
         st.success("Preferences saved. Restart the backend services if required.")
+
+
+def _render_account_panel() -> None:
+    user = st.session_state.get("user") or {}
+    auth_error = st.session_state.get("auth_error")
+
+    if auth_error:
+        st.error(auth_error)
+
+    if user and not user.get("is_default", False):
+        st.subheader("Account")
+        st.caption(
+            f"Signed in as {user.get('email', 'unknown')}"
+            + (" (default)" if user.get("is_default") else "")
+        )
+        if st.button("Sign out", key="logout_button", use_container_width=True):
+            st.session_state["auth_token"] = None
+            st.session_state["user"] = None
+            st.session_state["auth_error"] = None
+            _ensure_authenticated(force_refresh=True)
+            _rerun()
+    else:
+        st.subheader("Account")
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            submit = st.form_submit_button("Sign in", use_container_width=True)
+            if submit:
+                if not email or not password:
+                    st.session_state["auth_error"] = "Email and password are required."
+                    _rerun()
+                else:
+                    try:
+                        resp = _request_json(
+                            "post",
+                            "/auth/login",
+                            json={"email": email.strip(), "password": password},
+                        )
+                        st.session_state["auth_token"] = resp.get("token")
+                        user_payload = resp.get("user", {})
+                        user_payload.setdefault("is_default", False)
+                        st.session_state["user"] = user_payload
+                        st.session_state["auth_error"] = None
+                        _rerun()
+                    except APIError as exc:
+                        st.session_state["auth_error"] = str(exc)
+                        _rerun()
+
+        with st.expander("Create account", expanded=False), st.form("register_form"):
+            reg_name = st.text_input("Full name", key="register_name")
+            reg_email = st.text_input("Email", key="register_email")
+            reg_password = st.text_input("Password", type="password", key="register_password")
+            register = st.form_submit_button("Create account", use_container_width=True)
+            if register:
+                if not reg_email or not reg_password:
+                    st.session_state["auth_error"] = "Registration requires an email and password."
+                    _rerun()
+                else:
+                    try:
+                        resp = _request_json(
+                            "post",
+                            "/auth/register",
+                            json={
+                                "email": reg_email.strip(),
+                                "password": reg_password,
+                                "full_name": reg_name or None,
+                            },
+                        )
+                        st.session_state["auth_token"] = resp.get("token")
+                        user_payload = resp.get("user", {})
+                        user_payload.setdefault("is_default", False)
+                        st.session_state["user"] = user_payload
+                        st.session_state["auth_error"] = None
+                        _rerun()
+                    except APIError as exc:
+                        st.session_state["auth_error"] = str(exc)
+                        _rerun()
 
 
 def _render_preview_tab() -> None:
@@ -614,6 +706,91 @@ def _handle_query(prompt: str, *, reason: str = "ask") -> None:
     st.toast(toast, icon="💡")
 
 
+def _render_backend_settings_tab() -> None:
+    st.subheader("Backend Settings")
+    st.caption(
+        "Configure external databases or storage endpoints. Saved connections stay local and are scoped to your account."
+    )
+
+    try:
+        connections = _fetch_backend_connections()
+    except APIError as exc:
+        st.error(f"Unable to load backend connections: {exc}")
+        connections = []
+
+    if connections:
+        for connection in connections:
+            with st.expander(f"{connection['name']} ({connection['kind']})", expanded=False):
+                name_input = st.text_input(
+                    "Name",
+                    value=connection["name"],
+                    key=f"backend_name_{connection['id']}",
+                )
+                config_input = st.text_area(
+                    "Configuration (JSON)",
+                    value=json.dumps(connection.get("config") or {}, indent=2),
+                    key=f"backend_config_{connection['id']}",
+                    height=180,
+                )
+                col_save, col_delete = st.columns(2)
+                if col_save.button("Save changes", key=f"backend_save_{connection['id']}"):
+                    if not name_input.strip():
+                        st.error("Name is required.")
+                    else:
+                        try:
+                            config_payload = json.loads(config_input or "{}")
+                        except json.JSONDecodeError as exc:
+                            st.error(f"Invalid JSON: {exc}")
+                        else:
+                            try:
+                                _request_json(
+                                    "put",
+                                    f"/backends/{connection['id']}",
+                                    json={"name": name_input.strip(), "config": config_payload},
+                                    timeout=10,
+                                )
+                                st.success("Connection updated")
+                                _rerun()
+                            except APIError as exc:
+                                st.error(f"Failed to update connection: {exc}")
+                if col_delete.button("Delete", key=f"backend_delete_{connection['id']}"):
+                    try:
+                        _delete_backend_connection(connection["id"])
+                        _rerun()
+                    except APIError as exc:
+                        st.error(f"Failed to delete connection: {exc}")
+    else:
+        st.info("No backend connections yet.")
+
+    st.divider()
+    st.subheader("Add Connection")
+    with st.form("backend_create_form"):
+        name = st.text_input("Name", key="backend_new_name")
+        kind = st.selectbox("Kind", ("postgres", "mysql", "s3"), key="backend_new_kind")
+        config_text = st.text_area(
+            "Configuration (JSON)",
+            value="{}",
+            key="backend_new_config",
+            height=180,
+        )
+        submitted = st.form_submit_button("Save connection", use_container_width=True)
+        if submitted:
+            if not name.strip():
+                st.error("Connection name is required.")
+            else:
+                try:
+                    config_payload = json.loads(config_text or "{}")
+                except json.JSONDecodeError as exc:
+                    st.error(f"Invalid JSON: {exc}")
+                else:
+                    try:
+                        _create_backend_connection(name.strip(), kind, config_payload)
+                        st.success("Connection saved")
+                        _rerun()
+                    except APIError as exc:
+                        st.error(f"Failed to save connection: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -627,8 +804,13 @@ def _request_json(
     params: dict[str, Any] | None = None,
     json: dict[str, Any] | None = None,
     files: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> Any:
     url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
+    request_headers = dict(headers or {})
+    token = st.session_state.get("auth_token")
+    if token:
+        request_headers.setdefault("Authorization", f"Bearer {token}")
     try:
         response = requests.request(
             method.upper(),
@@ -637,15 +819,27 @@ def _request_json(
             params=params,
             json=json,
             files=files,
+            headers=request_headers or None,
         )
+        if response.status_code == 401:
+            if st.session_state.get("auth_token"):
+                st.session_state["auth_token"] = None
+                st.session_state["user"] = None
+            raise APIError("Unauthorized")
         response.raise_for_status()
     except requests.RequestException as exc:  # pragma: no cover - streamlit surface
         raise APIError(str(exc)) from exc
 
+    if not response.content:
+        return {}
+
     content_type = response.headers.get("content-type", "")
     if "application/json" in content_type:
         return response.json()
-    return response.json()
+    try:
+        return response.json()
+    except ValueError:
+        return {}
 
 
 def _fetch_health() -> dict[str, Any] | None:
@@ -653,6 +847,22 @@ def _fetch_health() -> dict[str, Any] | None:
         return _request_json("get", "/health", timeout=5)
     except APIError:
         return None
+
+
+def _ensure_authenticated(force_refresh: bool = False) -> None:
+    if force_refresh:
+        st.session_state["user"] = None
+
+    if st.session_state.get("user") is not None:
+        return
+
+    try:
+        user = _request_json("get", "/auth/me", timeout=5)
+        st.session_state["user"] = user
+        st.session_state["auth_error"] = None
+    except APIError as exc:  # pragma: no cover - display in UI
+        st.session_state["user"] = None
+        st.session_state["auth_error"] = str(exc)
 
 
 def _fetch_recent_uploads() -> list[dict[str, Any]]:
@@ -704,6 +914,22 @@ def _service_statuses(health: dict[str, Any] | None) -> list[ServiceStatus]:
         )
     )
     return statuses
+
+
+def _fetch_backend_connections() -> list[dict[str, Any]]:
+    data = _request_json("get", "/backends", timeout=8)
+    if isinstance(data, dict):
+        return data.get("connections", [])
+    return []
+
+
+def _create_backend_connection(name: str, kind: str, config: dict[str, Any]) -> dict[str, Any]:
+    payload = {"name": name, "kind": kind, "config": config}
+    return _request_json("post", "/backends", json=payload, timeout=10)
+
+
+def _delete_backend_connection(connection_id: int) -> None:
+    _request_json("delete", f"/backends/{connection_id}", timeout=10)
 
 
 def _persist_env_vars(updates: dict[str, str | None]) -> None:

@@ -25,10 +25,10 @@ class TablePreview:
     sheet_names: list[str] | None = None
 
 
-def cache_key(content: bytes, sheet: str | None) -> str:
+def cache_key(content: bytes, sheet: str | None, user_id: str = "default") -> str:
     h = sha256(content).hexdigest()[:16]
     suffix = f":{sheet}" if sheet else ""
-    return f"dawn:dev:preview:{h}{suffix}"
+    return f"dawn:dev:preview:{user_id}:{h}{suffix}"
 
 
 def _sanitize_scalar(x: Any) -> Any:
@@ -79,13 +79,17 @@ def df_profile(df: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 def preview_from_bytes(
-    content: bytes, sheet_name: str | None = None, max_rows: int = PREVIEW_ROWS
+    content: bytes,
+    sheet_name: str | None = None,
+    max_rows: int = PREVIEW_ROWS,
+    *,
+    user_id: str = "default",
 ) -> TablePreview:
     import json
 
     xl = pd.ExcelFile(BytesIO(content))
     name = sheet_name or xl.sheet_names[0]
-    key = cache_key(content, name)
+    key = cache_key(content, name, user_id)
     cached = redis_sync.get(key)
     if cached:
         obj = json.loads(cached)

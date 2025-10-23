@@ -76,10 +76,13 @@ def create_job(
     transform_version: int | None = None,
     schedule: str | None = None,
     is_active: bool = True,
+    user_id: int,
 ) -> dict[str, Any]:
     with session_scope() as session:
         feed = (
-            session.execute(select(Feed).where(Feed.identifier == feed_identifier))
+            session.execute(
+                select(Feed).where(Feed.identifier == feed_identifier, Feed.user_id == user_id)
+            )
             .scalars()
             .first()
         )
@@ -91,7 +94,11 @@ def create_job(
         transform_version_id = None
         if transform_name:
             transform = (
-                session.execute(select(Transform).where(Transform.name == transform_name))
+                session.execute(
+                    select(Transform).where(
+                        Transform.name == transform_name, Transform.user_id == user_id
+                    )
+                )
                 .scalars()
                 .first()
             )
@@ -110,30 +117,37 @@ def create_job(
             transform_version_id=transform_version_id,
             schedule=schedule,
             is_active=is_active,
+            user_id=user_id,
         )
         session.add(job)
         session.flush()
         return _serialize_job(session, job)
 
 
-def get_job(job_id: int) -> dict[str, Any]:
+def get_job(job_id: int, *, user_id: int) -> dict[str, Any]:
     with session_scope() as session:
         job = session.get(Job, job_id)
-        if job is None:
+        if job is None or job.user_id != user_id:
             raise JobError(f"Job id={job_id} not found")
         return _serialize_job(session, job)
 
 
-def list_jobs() -> list[dict[str, Any]]:
+def list_jobs(*, user_id: int) -> list[dict[str, Any]]:
     with session_scope() as session:
-        jobs = session.execute(select(Job).order_by(desc(Job.created_at))).scalars().all()
+        jobs = (
+            session.execute(
+                select(Job).where(Job.user_id == user_id).order_by(desc(Job.created_at))
+            )
+            .scalars()
+            .all()
+        )
         return [_serialize_job(session, job) for job in jobs]
 
 
-def get_job_run(run_id: int) -> dict[str, Any]:
+def get_job_run(run_id: int, *, user_id: int) -> dict[str, Any]:
     with session_scope() as session:
         run = session.get(JobRun, run_id)
-        if run is None:
+        if run is None or run.user_id != user_id:
             raise JobError(f"JobRun id={run_id} not found")
         return _job_run_to_dict(run)
 
@@ -160,7 +174,12 @@ def _prepare_job_run(job_id: int) -> JobRunContext:
                 raise JobError(f"Transform version id={job.transform_version_id} not found")
             dry_run_report = dict(transform_version.dry_run_report or {})
 
-        run = JobRun(job_id=job_id, status="running", started_at=datetime.utcnow())
+        run = JobRun(
+            job_id=job_id,
+            status="running",
+            started_at=datetime.utcnow(),
+            user_id=job.user_id,
+        )
         session.add(run)
         session.flush()
 
@@ -226,7 +245,9 @@ def _finalise_job_run(
 
 
 def _resolve_feed_version(session, feed: Feed, version: int | None) -> FeedVersion:
-    stmt = select(FeedVersion).where(FeedVersion.feed_id == feed.id)
+    stmt = select(FeedVersion).where(
+        FeedVersion.feed_id == feed.id, FeedVersion.user_id == feed.user_id
+    )
     if version is not None:
         stmt = stmt.where(FeedVersion.version == version)
     stmt = stmt.order_by(desc(FeedVersion.version)).limit(1)
@@ -239,7 +260,10 @@ def _resolve_feed_version(session, feed: Feed, version: int | None) -> FeedVersi
 def _resolve_transform_version(
     session, transform: Transform, version: int | None
 ) -> TransformVersion | None:
-    stmt = select(TransformVersion).where(TransformVersion.transform_id == transform.id)
+    stmt = select(TransformVersion).where(
+        TransformVersion.transform_id == transform.id,
+        TransformVersion.user_id == transform.user_id,
+    )
     if version is not None:
         stmt = stmt.where(TransformVersion.version == version)
     stmt = stmt.order_by(desc(TransformVersion.version)).limit(1)
@@ -270,6 +294,7 @@ def _serialize_job(session, job: Job) -> dict[str, Any]:
         "schedule": job.schedule,
         "is_active": job.is_active,
         "created_at": job.created_at.isoformat(),
+        "user_id": job.user_id,
         "last_run": _job_run_to_dict(last_run) if last_run else None,
     }
 
@@ -287,4 +312,5 @@ def _job_run_to_dict(job_run: JobRun | None) -> dict[str, Any]:
         "warnings": job_run.warnings or [],
         "validation": job_run.validation or {},
         "logs": job_run.logs or [],
+        "user_id": job_run.user_id,
     }

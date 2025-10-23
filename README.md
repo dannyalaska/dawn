@@ -32,8 +32,9 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 | **FastAPI** | `/ingest/preview`, `/rag/index_excel`, `/rag/context`, `/rag/memory`, `/rag/chat`, `/jobs`, etc. |
 | **pandas** | Profiling, counts, numeric stats, aggregation execution. |
 | **APScheduler** | Background job scheduling and execution for automated data processing. |
-| **LLM** | Generates analysis plan + assists with narrative answers when metrics aren't enough. |
-| **Redis** | Vector store for context notes plus JSON hashes for plan/relationships/notes. |
+| **LLM / LangChain** | LangGraph orchestrates retrieval-augmented chat and NL2SQL prompts across OpenAI, LM Studio, Ollama, or Anthropic with citation guardrails. |
+| **Auth & Settings** | Local user accounts with per-user storage plus backend connector management (MySQL/Postgres/S3). |
+| **Redis** | Vector store for context notes (LangChain Redis adapter) plus JSON hashes for plan/relationships/notes. |
 | **Postgres** | Durable storage for uploads, jobs, and summary JSON (metrics, plan, relationships). |
 
 ---
@@ -80,6 +81,9 @@ Open the Streamlit app and you’ll land on a simplified workspace:
 - **Upload & Preview** – profile an Excel workbook and review sample rows.
 - **Context & Memory** – inspect the captured context notes and add your own guidance.
 - **Ask Dawn** – run retrieval-augmented questions with instant suggestions.
+- **Backend Settings** – configure credentials for Postgres, MySQL, or S3 connectors per account.
+
+Authentication is local-first: the app boots with a default account (`local@dawn.internal`). Use the **Account** panel in the sidebar to register new users, sign in, or manage tokens—each user keeps an isolated Redis/Postgres namespace.
 
 ### Sample data
 - `demo_assets/support_copilot_demo.xlsx` — synthetic support tickets with agents + KPIs.

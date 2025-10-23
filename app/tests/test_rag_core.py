@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 
 from app.core import rag
@@ -26,15 +28,18 @@ def test_format_context_limits_length():
 
 
 def test_list_context_chunks_handles_binary_embeddings(monkeypatch):
+    user_id = "user1"
+
     class _FakeRedis:
         def __init__(self) -> None:
-            key = rag._doc_key("abc123")
+            key = rag._doc_key(user_id, "abc123")
             self._store = {
                 key: {
                     "text": "Original chunk",
                     "source": "demo:Sheet1",
                     "row_index": "5",
                     "type": "excel",
+                    "metadata": json.dumps({"id": "abc123", "user_id": user_id}),
                     rag.VEC_FIELD: np.zeros(384, dtype=np.float32).tobytes(),
                 }
             }
@@ -43,6 +48,9 @@ def test_list_context_chunks_handles_binary_embeddings(monkeypatch):
             prefix = match.rstrip("*")
             return [key for key in self._store if key.startswith(prefix)]
 
+        def hgetall(self, key: str):
+            return dict(self._store.get(key, {}))
+
         def hmget(self, key: str, *fields: str):
             data = self._store.get(key, {})
             return [data.get(field) for field in fields]
@@ -50,7 +58,7 @@ def test_list_context_chunks_handles_binary_embeddings(monkeypatch):
     fake = _FakeRedis()
     monkeypatch.setattr(rag, "redis_sync", fake)
 
-    chunks = rag.list_context_chunks(source="demo:Sheet1", limit=10)
+    chunks = rag.list_context_chunks(user_id=user_id, source="demo:Sheet1", limit=10)
     assert len(chunks) == 1
     assert chunks[0]["text"] == "Original chunk"
     assert chunks[0]["type"] == "excel"

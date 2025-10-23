@@ -30,5 +30,8 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str | None = "gpt-4o-mini"
     OLLAMA_MODEL: str | None = "llama3.1"
 
+    # Auth
+    AUTH_REQUIRED: bool = False
+
 
 settings = Settings()
