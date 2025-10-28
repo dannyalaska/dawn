@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from collections.abc import Iterable, Sequence
@@ -24,6 +25,7 @@ from redis.commands.search.index_definition import (  # type: ignore[import-unty
     IndexType,
 )
 from redis.commands.search.query import Query  # type: ignore[import-untyped]
+from redis.exceptions import ResponseError
 
 from app.core.redis_client import redis_sync
 
@@ -62,11 +64,47 @@ def _doc_key(user_id: str, docid: str) -> str:
 
 
 def _ensure_index(redis: Redis, dim: int = 384) -> None:
+    required_fields = {
+        "text",
+        "source",
+        "type",
+        "row_index",
+        "user_id",
+        "tags",
+        "metadata",
+        "column_name",
+        VEC_FIELD,
+    }
+    needs_rebuild = False
+
     try:
-        redis.ft(INDEX_NAME).info()
-        return
+        info = redis.ft(INDEX_NAME).info()
+        attributes = info.get("attributes", [])
+        parsed: dict[str, dict[str, Any]] = {}
+        for attr in attributes:
+            data = {attr[i]: attr[i + 1] for i in range(0, len(attr), 2)}
+            identifier = data.get("identifier")
+            if identifier:
+                parsed[str(identifier)] = data
+        missing = required_fields.difference(parsed.keys())
+        if missing:
+            needs_rebuild = True
+        else:
+            vec_meta = parsed.get(VEC_FIELD, {})
+            try:
+                current_dim = int(vec_meta.get("dim", 0))
+            except (TypeError, ValueError):
+                current_dim = 0
+            if current_dim != dim:
+                needs_rebuild = True
     except Exception:  # noqa: BLE001
-        pass
+        needs_rebuild = True
+
+    if not needs_rebuild:
+        return
+
+    with contextlib.suppress(ResponseError):
+        redis.ft(INDEX_NAME).dropindex(delete_documents=False)
 
     schema = [
         TextField("text"),
@@ -365,28 +403,61 @@ def list_context_chunks(
     pattern = f"{PREFIX}{user_id}:*"
     chunks: list[dict[str, Any]] = []
     for key in redis_sync.scan_iter(match=pattern):
-        data = redis_sync.hgetall(key)
-        if not data:
+        (
+            text_val,
+            source_val,
+            metadata_raw,
+            row_raw,
+            type_val,
+            tags_raw,
+        ) = redis_sync.hmget(
+            key,
+            "text",
+            "source",
+            "metadata",
+            "row_index",
+            "type",
+            "tags",
+        )
+        if not any([text_val, source_val, metadata_raw, row_raw, type_val]):
             continue
-        raw_source = data.get("source")
-        if source and raw_source != source:
-            continue
-        metadata_raw = data.get("metadata")
+
         metadata: dict[str, Any] = {}
         if metadata_raw:
             try:
                 metadata = json.loads(metadata_raw)
             except Exception:  # noqa: BLE001
                 metadata = {}
-        doc_id = key[len(f"{PREFIX}{user_id}:") :]
+
+        raw_source = metadata.get("source") or source_val or ""
+        if source and raw_source != source:
+            continue
+
+        doc_id = metadata.get("id") or key[len(f"{PREFIX}{user_id}:") :]
+        tags = metadata.get("tags")
+        if not tags and tags_raw:
+            if isinstance(tags_raw, str):
+                tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+            else:
+                tags = tags_raw
+
+        row_index_val = metadata.get("row_index", row_raw or -1)
+        if isinstance(row_index_val, str):
+            try:
+                row_index_val = int(row_index_val)
+            except ValueError:
+                row_index_val = -1
+
+        chunk_type = metadata.get("type") or type_val or "excel"
+
         chunks.append(
             {
                 "id": metadata.get("id", doc_id),
-                "text": data.get("text", ""),
+                "text": text_val or "",
                 "source": raw_source,
-                "row_index": int(data.get("row_index", -1) or -1),
-                "type": metadata.get("type") or data.get("type", "excel"),
-                "tags": metadata.get("tags", []),
+                "row_index": int(row_index_val or -1),
+                "type": chunk_type,
+                "tags": tags or [],
             }
         )
         if len(chunks) >= limit:

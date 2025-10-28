@@ -203,7 +203,7 @@ def _render_llm_settings() -> None:
         if key.strip():
             updates["ANTHROPIC_API_KEY"] = key.strip()
 
-    if st.button("Save preferences", use_container_width=True):
+    if st.button("Save preferences", width="stretch"):
         _persist_env_vars(updates)
         st.session_state["llm_provider"] = provider_choice
         st.success("Preferences saved. Restart the backend services if required.")
@@ -222,7 +222,7 @@ def _render_account_panel() -> None:
             f"Signed in as {user.get('email', 'unknown')}"
             + (" (default)" if user.get("is_default") else "")
         )
-        if st.button("Sign out", key="logout_button", use_container_width=True):
+        if st.button("Sign out", key="logout_button", width="stretch"):
             st.session_state["auth_token"] = None
             st.session_state["user"] = None
             st.session_state["auth_error"] = None
@@ -233,7 +233,7 @@ def _render_account_panel() -> None:
         with st.form("login_form"):
             email = st.text_input("Email", key="login_email")
             password = st.text_input("Password", type="password", key="login_password")
-            submit = st.form_submit_button("Sign in", use_container_width=True)
+            submit = st.form_submit_button("Sign in", width="stretch")
             if submit:
                 if not email or not password:
                     st.session_state["auth_error"] = "Email and password are required."
@@ -259,7 +259,7 @@ def _render_account_panel() -> None:
             reg_name = st.text_input("Full name", key="register_name")
             reg_email = st.text_input("Email", key="register_email")
             reg_password = st.text_input("Password", type="password", key="register_password")
-            register = st.form_submit_button("Create account", use_container_width=True)
+            register = st.form_submit_button("Create account", width="stretch")
             if register:
                 if not reg_email or not reg_password:
                     st.session_state["auth_error"] = "Registration requires an email and password."
@@ -298,7 +298,7 @@ def _render_preview_tab() -> None:
         value=st.session_state.get("preview_sheet") or "",
         help="Leave blank to analyse the first sheet.",
     )
-    preview_button = st.button("Generate preview", use_container_width=True)
+    preview_button = st.button("Generate preview", width="stretch")
     if preview_button:
         if uploaded is None:
             st.warning("Select a workbook before generating a preview.")
@@ -325,14 +325,14 @@ def _render_preview_details(preview: dict[str, Any]) -> None:
     st.markdown("##### Columns")
     columns_df = pd.DataFrame(preview.get("columns") or [])
     if not columns_df.empty:
-        st.dataframe(columns_df, use_container_width=True, hide_index=True)
+        st.dataframe(columns_df, width="stretch", hide_index=True)
     else:
         st.caption("No columns detected.")
 
     st.markdown("##### Sample rows")
     rows_df = pd.DataFrame(preview.get("rows") or [])
     if not rows_df.empty:
-        st.dataframe(rows_df, use_container_width=True, hide_index=True, height=260)
+        st.dataframe(rows_df, width="stretch", hide_index=True, height=260)
     else:
         st.caption("No sample rows returned.")
 
@@ -342,7 +342,7 @@ def _render_preview_details(preview: dict[str, Any]) -> None:
         st.caption("Re-upload the workbook above and regenerate the preview to enable indexing.")
     if st.button(
         "Index dataset",
-        use_container_width=True,
+        width="stretch",
         disabled=preview_file is None,
         help=None if preview_file else "Upload the original file to index it into Redis.",
     ):
@@ -364,7 +364,7 @@ def _render_summary(summary: dict[str, Any]) -> None:
             values = metric.get("values") or []
             df = pd.DataFrame(values, columns=["Value", "Count"])
             st.write(f"**{label}**")
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
     elif insights:
         for key, values in list(insights.items())[:3]:
             preview = ", ".join(f"{entry['label']} ({entry['count']})" for entry in values[:3])
@@ -398,7 +398,7 @@ def _render_recent_uploads() -> None:
         if delete_col.button("Remove cached preview", key=f"delete_{entry['sha16']}"):
             _delete_cached_preview(entry)
 
-    if st.button("Clear all cached previews", use_container_width=True):
+    if st.button("Clear all cached previews", width="stretch"):
         _clear_cached_previews()
 
 
@@ -411,7 +411,7 @@ def _render_context_tab() -> None:
 
     st.write(f"Active source: `{source}`")
     st.caption("These notes are short excerpts Dawn saved so answers can cite the original data.")
-    if st.button("Refresh context", use_container_width=True):
+    if st.button("Refresh context", width="stretch"):
         _refresh_context()
 
     chunks = st.session_state.get("context_notes") or []
@@ -468,7 +468,7 @@ def _render_ask_tab() -> None:
         st.markdown("##### Latest answer")
         st.write(answer.get("text") or "_No answer yet._")
         st.caption(f"Asked: {answer.get('timestamp')}")
-        if st.button("Regenerate", use_container_width=True):
+        if st.button("Regenerate", width="stretch"):
             last_prompt = st.session_state.get("last_prompt")
             if last_prompt:
                 _handle_query(last_prompt, reason="regenerate")
@@ -479,7 +479,7 @@ def _render_ask_tab() -> None:
         placeholder="e.g. Who resolved the most tickets last week?",
         height=140,
     )
-    ask_button = st.button("Send", use_container_width=True)
+    ask_button = st.button("Send", width="stretch")
     if ask_button:
         if prompt.strip():
             _handle_query(prompt.strip())
@@ -773,7 +773,7 @@ def _render_backend_settings_tab() -> None:
             key="backend_new_config",
             height=180,
         )
-        submitted = st.form_submit_button("Save connection", use_container_width=True)
+        submitted = st.form_submit_button("Save connection", width="stretch")
         if submitted:
             if not name.strip():
                 st.error("Connection name is required.")
