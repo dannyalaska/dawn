@@ -389,6 +389,52 @@ Ask questions about feeds using RAG + LLM.
 
 ---
 
+## Agents API
+
+### POST `/agents/analyze`
+Trigger the coordinated multi-agent workflow for a given feed.
+
+**Request Body:**
+```json
+{
+  "feed_identifier": "support_tickets",
+  "question": "Who resolved the most tickets last week?",
+  "refresh_context": true,
+  "max_plan_steps": 8,
+  "retrieval_k": 6
+}
+```
+
+**Response:**
+```json
+{
+  "status": "warnings",
+  "feed_identifier": "support_tickets",
+  "feed_name": "Support Tickets",
+  "feed_version": 4,
+  "plan": [...],
+  "completed": [...],
+  "context_updates": [...],
+  "warnings": ["No value counts available for column 'Owner'."],
+  "answer": "Alex resolved the most tickets (143)...",
+  "answer_sources": [...],
+  "final_report": "- Count rows by Status: Status: Open: 120, Closed: 980...",
+  "run_log": [
+    {"agent": "bootstrap", "message": "Feed summary loaded.", "feed_version": 4},
+    {"agent": "planner", "message": "Planner produced 6 steps."},
+    {"agent": "executor", "message": "Executed 6 tasks."},
+    {"agent": "memory", "message": "Memory curator processed 6 results.", "chunks_inserted": 6},
+    {"agent": "qa", "message": "Answer generated.", "sources": 3},
+    {"agent": "guardrail", "message": "Validation complete.", "warnings": 1},
+    {"agent": "responder", "message": "Session complete."}
+  ]
+}
+```
+
+Agents persist metric summaries into Redis when `refresh_context` is true, so subsequent chat questions inherit the latest context without re-ingesting the feed.
+
+---
+
 ## Excel API
 
 ### POST `/excel/upload`

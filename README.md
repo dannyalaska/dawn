@@ -22,6 +22,11 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 - If a metric doesn’t exist, Dawn falls back to those context notes and the LLM with citations.
 - Chat responses combine the verified numbers with contextual snippets for explainability.
 
+### 4. Multi-agent orchestrator
+- A LangGraph-powered swarm coordinates planning, metric execution, memory curation, and QA.
+- Trigger the workflow via `POST /agents/analyze` to refresh context, surface insights, and answer follow-ups cooperatively.
+- Every agent logs its actions so you can audit the plan, execution steps, and guardrail warnings in one payload.
+
 ---
 
 ## Architecture

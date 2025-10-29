@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
+from app.api.agents import router as agents_router
 from app.api.auth import router as auth_router
 from app.api.backends import router as backends_router
 from app.api.excel import router as excel_router
@@ -154,3 +155,4 @@ app.include_router(rag_router)
 app.include_router(transforms_router)
 app.include_router(nl_router)
 app.include_router(jobs_router)
+app.include_router(agents_router)
