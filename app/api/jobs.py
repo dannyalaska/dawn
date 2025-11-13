@@ -13,6 +13,7 @@ from app.core.orchestration import (
     get_job,
     list_jobs,
 )
+from app.core.runner_meta import gather_runner_stats
 from app.core.scheduler import get_scheduler
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -124,3 +125,8 @@ def scheduler_status(current_user: CurrentUser) -> dict[str, Any]:
         }
     except Exception as exc:
         raise HTTPException(500, f"Failed to get scheduler status: {exc}") from exc
+
+
+@router.get("/runner/meta")
+def runner_meta(current_user: CurrentUser) -> dict[str, Any]:
+    return gather_runner_stats(current_user.id)

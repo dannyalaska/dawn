@@ -42,6 +42,77 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 | **Redis** | Vector store for context notes (LangChain Redis adapter) plus JSON hashes for plan/relationships/notes. |
 | **Postgres** | Durable storage for uploads, jobs, and summary JSON (metrics, plan, relationships). |
 
+### System Diagram
+
+```mermaid
+flowchart TD
+    subgraph UI
+        ST[Streamlit App\nUpload · Context · Agent Swarm · Ask]
+    end
+
+    subgraph API["FastAPI Service"]
+        FEEDS[/feeds · /ingest/preview/]
+        RAG[/rag/*]
+        AGENTS[/agents/analyze]
+        JOBS[/jobs/*]
+        NLSQL[/nl/sql]
+    end
+
+    subgraph Engine
+        INGEST[Ingestion & Profiling\npandas · dq rules]
+        CHAT[LangGraph Chat Graph\nRAG + Guardrails]
+        SWARM[LangGraph Agent Swarm\nPlanner · Executor · Memory · QA]
+        SCHED[APScheduler\nBackground Jobs]
+    end
+
+    subgraph Storage
+        PG[(Postgres\nFeeds · Versions · Jobs)]
+        RD[(Redis\nVectors · Memory · Plans)]
+        FS[(File Storage / S3 Uploads)]
+    end
+
+    subgraph LLMs["LLM Providers"]
+        OLLAMA[Ollama]
+        LMSTUDIO[LM Studio]
+        OPENAI[OpenAI]
+        ANTHROPIC[Anthropic]
+        STUB[Stub]
+    end
+
+    ST -->|REST| FEEDS
+    ST -->|REST| RAG
+    ST -->|REST| AGENTS
+    ST -->|REST| NLSQL
+    ST -->|REST| JOBS
+
+    FEEDS --> INGEST
+    RAG --> CHAT
+    AGENTS --> SWARM
+    NLSQL --> CHAT
+    JOBS --> SCHED
+
+    INGEST --> PG
+    INGEST --> RD
+    INGEST --> FS
+
+    CHAT --> RD
+    SWARM --> RD
+    SWARM --> PG
+
+    CHAT -->|tool calls| OLLAMA
+    CHAT --> OPENAI
+    CHAT --> LMSTUDIO
+    CHAT --> ANTHROPIC
+    CHAT --> STUB
+    SWARM --> OLLAMA
+    SWARM --> OPENAI
+    SWARM --> LMSTUDIO
+    SWARM --> ANTHROPIC
+    SWARM --> STUB
+
+    SCHED --> FEEDS
+```
+
 ---
 
 ## Quickstart
@@ -86,7 +157,9 @@ Open the Streamlit app and you’ll land on a simplified workspace:
 - **Upload & Preview** – profile an Excel workbook and review sample rows.
 - **Context & Memory** – inspect the captured context notes and add your own guidance.
 - **Ask Dawn** – run retrieval-augmented questions with instant suggestions.
-- **Backend Settings** – configure credentials for Postgres, MySQL, or S3 connectors per account.
+- **Backend Settings** – configure Postgres, Snowflake, MySQL, or S3 connectors per account and lock agents to explicit schema grants.
+- **Materialized Tables** – every upload becomes a local SQL table so agents and NL2SQL can query the full dataset later.
+- **Auto-Seeded Postgres** – if your `.env` supplies `POSTGRES_DSN` (or `BACKEND_AUTO_CONNECTIONS`), Dawn automatically registers that database as a backend connection for the default user so agents can query it immediately.
 
 Authentication is local-first: the app boots with a default account (`local@dawn.internal`). Use the **Account** panel in the sidebar to register new users, sign in, or manage tokens—each user keeps an isolated Redis/Postgres namespace.
 
@@ -102,9 +175,26 @@ Feel free to delete these files if you do not want demo content in your fork. Th
 poetry run ruff check
 poetry run mypy app
 poetry run pytest
+python -m app.cli runner stats
 ```
 
 Pre-commit is configured (`poetry run pre-commit run --all-files`).
+
+### Docker
+
+Build the app container:
+
+```bash
+docker build -t dawn .
+```
+
+Then run it, pointing Dawn at your own Postgres/Redis via `.env` (or explicit env vars):
+
+```bash
+docker run --env-file .env -p 8000:8000 -p 8501:8501 dawn
+```
+
+The entrypoint runs migrations and starts both FastAPI (`:8000`) and Streamlit (`:8501`). Provide database/redis credentials via environment so the container can reuse your existing infrastructure.
 
 ---
 

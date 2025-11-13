@@ -34,7 +34,8 @@ dependencies = [
     "langgraph (>=0.3.30,<0.4.0)",
     "langchain-huggingface (>=0.3.0,<0.4.0)",
     "passlib (>=1.7.4,<1.8.0)",
-    "email-validator (>=2.1.0,<3.0.0)"
+    "email-validator (>=2.1.0,<3.0.0)",
+    "snowflake-connector-python (>=3.12.0,<4.0.0)"
 ]
 
 

@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+*.pyc
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+dawn_dev.sqlite3
+infra/**
+*.log
+*.env
+/docker-compose*.yml

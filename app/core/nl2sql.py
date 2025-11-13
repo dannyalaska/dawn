@@ -15,10 +15,22 @@ from langgraph.graph import END, StateGraph
 from sqlalchemy import select
 from sqlglot import exp
 
+from app.core.backend_connectors import (
+    BackendConnectorError,
+    get_schema_grants,
+    list_backend_tables,
+)
 from app.core.chat_models import StubChatModel, get_chat_model
 from app.core.config import settings
 from app.core.db import session_scope
-from app.core.models import Feed, FeedVersion, Transform, TransformVersion
+from app.core.models import (
+    BackendConnection,
+    Feed,
+    FeedDataset,
+    FeedVersion,
+    Transform,
+    TransformVersion,
+)
 from app.core.rag import format_context, search
 from app.core.redis_client import redis_sync
 from app.core.transforms import TransformDefinition
@@ -39,6 +51,17 @@ class TableManifest:
     foreign_keys: list[dict[str, Any]]
     description: str | None = None
     kind: str = "feed"
+    schema: str | None = None
+    table: str | None = None
+    connection_id: int | None = None
+    dialect: str | None = None
+
+
+def _ensure_int_user_id(value: str | int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - defensive guard
+        raise ValueError("user_id must be numeric for manifest generation") from exc
 
 
 def _load_recent_questions(limit: int = 10, *, user_id: str) -> list[str]:
@@ -71,6 +94,7 @@ def _manifest_from_feed(feed: Feed, version: FeedVersion) -> TableManifest:
         foreign_keys=schema.get("foreign_keys", []),
         description=feed.name,
         kind="feed",
+        table=feed.identifier,
     )
 
 
@@ -99,16 +123,22 @@ def _manifest_from_transform(
         foreign_keys=[],
         description=transform.description,
         kind="transform",
+        table=definition.target_table,
     )
 
 
-def build_manifest(feed_identifiers: list[str] | None = None) -> list[TableManifest]:
+def build_manifest(
+    *,
+    user_id: str | int,
+    feed_identifiers: list[str] | None = None,
+) -> list[TableManifest]:
     manifests: list[TableManifest] = []
-
+    numeric_user = _ensure_int_user_id(user_id)
     with session_scope() as s:
         feed_stmt = (
             select(Feed, FeedVersion)
             .join(FeedVersion, Feed.id == FeedVersion.feed_id)
+            .where(Feed.user_id == numeric_user)
             .order_by(Feed.id, FeedVersion.version.desc())
         )
         if feed_identifiers:
@@ -125,6 +155,7 @@ def build_manifest(feed_identifiers: list[str] | None = None) -> list[TableManif
         transform_stmt = (
             select(Transform, TransformVersion)
             .join(TransformVersion, Transform.id == TransformVersion.transform_id)
+            .where(Transform.user_id == numeric_user)
             .order_by(Transform.id, TransformVersion.version.desc())
         )
         if feed_identifiers and seen_feed_ids:
@@ -139,6 +170,94 @@ def build_manifest(feed_identifiers: list[str] | None = None) -> list[TableManif
             if manifest:
                 manifests.append(manifest)
 
+    manifests.extend(_feed_dataset_manifests(numeric_user))
+    manifests.extend(_backend_table_manifests(numeric_user))
+    return manifests
+
+
+def _backend_table_manifests(user_id: int) -> list[TableManifest]:
+    manifests: list[TableManifest] = []
+    with session_scope() as session:
+        rows = (
+            session.execute(select(BackendConnection).where(BackendConnection.user_id == user_id))
+            .scalars()
+            .all()
+        )
+        connections = [
+            {
+                "id": conn.id,
+                "name": conn.name,
+                "kind": conn.kind,
+                "config": dict(conn.config or {}),
+            }
+            for conn in rows
+        ]
+    for connection in connections:
+        config = connection["config"]
+        schemas = get_schema_grants(config)
+        if not schemas:
+            continue
+        try:
+            tables = list_backend_tables(connection["kind"], config, schemas)
+        except BackendConnectorError:
+            continue
+        for table in tables:
+            schema_name = table.get("schema")
+            table_name = table.get("table")
+            if not schema_name or not table_name:
+                continue
+            qualified = f"{schema_name}.{table_name}"
+            manifests.append(
+                TableManifest(
+                    name=qualified,
+                    columns=table.get("columns", []),
+                    source=f"backend:{connection['id']}:{qualified}",
+                    primary_keys=table.get("primary_keys", []),
+                    foreign_keys=[],
+                    description=f"{connection['name']} ({connection['kind']})",
+                    kind=connection["kind"],
+                    schema=schema_name,
+                    table=table_name,
+                    connection_id=connection["id"],
+                )
+            )
+    return manifests
+
+
+def _feed_dataset_manifests(user_id: int) -> list[TableManifest]:
+    manifests: list[TableManifest] = []
+    with session_scope() as session:
+        rows = session.execute(
+            select(FeedDataset, Feed)
+            .join(Feed, FeedDataset.feed_id == Feed.id)
+            .where(Feed.user_id == user_id)
+        ).all()
+        datasets = [
+            {
+                "table_name": dataset.table_name,
+                "schema_name": dataset.schema_name,
+                "columns": list(dataset.columns or []),
+                "id": dataset.id,
+                "feed_name": feed.name,
+            }
+            for dataset, feed in rows
+        ]
+    for entry in datasets:
+        schema_name = entry["schema_name"] or "public"
+        manifests.append(
+            TableManifest(
+                name=entry["table_name"],
+                columns=entry["columns"],
+                source=f"feed_dataset:{entry['id']}",
+                primary_keys=[],
+                foreign_keys=[],
+                description=f"{entry['feed_name']} materialized",
+                kind="feed_table",
+                schema=schema_name,
+                table=entry["table_name"],
+                connection_id=entry["id"],
+            )
+        )
     return manifests
 
 
@@ -147,7 +266,10 @@ def _schema_block(manifest: list[TableManifest]) -> str:
     for table in manifest:
         cols = ", ".join(table.columns) if table.columns else "(columns unknown)"
         pk = ", ".join(table.primary_keys) if table.primary_keys else "none"
-        lines.append(f"- {table.name} [{table.kind}] — columns: {cols}; primary keys: {pk}.")
+        context = table.kind
+        if table.schema:
+            context = f"{table.kind} · schema {table.schema}"
+        lines.append(f"- {table.name} [{context}] — columns: {cols}; primary keys: {pk}.")
     return "\n".join(lines)
 
 
@@ -294,7 +416,16 @@ def _clean_sql(sql_text: str) -> str:
 
 
 def _manifest_lookup(manifest: list[TableManifest]) -> dict[str, TableManifest]:
-    return {table.name.lower(): table for table in manifest}
+    lookup: dict[str, TableManifest] = {}
+    for table in manifest:
+        keys = {table.name.lower()}
+        if table.table:
+            keys.add(table.table.lower())
+        if table.schema and table.table:
+            keys.add(f"{table.schema.lower()}.{table.table.lower()}")
+        for key in keys:
+            lookup[key] = table
+    return lookup
 
 
 def validate_sql(
@@ -339,9 +470,21 @@ def validate_sql(
         name = table.name
         if not name:
             continue
-        tables_used.append(name)
-        if name.lower() not in lookup:
-            errors.append(f"Unknown table referenced: {name}")
+        db = table.db or ""
+        key = name.lower()
+        match = None
+        if db:
+            qualified = f"{db.lower()}.{key}"
+            match = lookup.get(qualified)
+        if match is None and table.catalog:
+            catalog_qualified = f"{table.catalog.lower()}.{key}"
+            match = lookup.get(catalog_qualified)
+        if match is None:
+            match = lookup.get(key)
+        if match is None:
+            errors.append(f"Unknown table referenced: {name if not db else f'{db}.{name}'}")
+        else:
+            tables_used.append(match.name)
 
     # collect columns
     for column in statement.find_all(exp.Column):
@@ -384,7 +527,7 @@ def nl_to_sql(
     explain: bool = False,
     user_id: str = "default",
 ) -> dict[str, Any]:
-    manifest = build_manifest(feed_identifiers)
+    manifest = build_manifest(user_id=user_id, feed_identifiers=feed_identifiers)
     recent = _load_recent_questions(user_id=user_id)
     state = _run_graph(question, manifest, recent, user_id=user_id)
     prompt = state.get("prompt") or _prompt(

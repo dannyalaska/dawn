@@ -19,6 +19,8 @@ from app.api.jobs import router as jobs_router
 from app.api.nl_sql import router as nl_router
 from app.api.rag import router as rag_router
 from app.api.transforms import router as transforms_router
+from app.core.auth import ensure_default_user
+from app.core.backend_seed import seed_backend_connections
 from app.core.config import settings
 from app.core.db import init_database, session_scope
 from app.core.rag import _ensure_index  # type: ignore[attr-defined]
@@ -30,6 +32,8 @@ from app.core.scheduler import start_scheduler, stop_scheduler
 async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan handler that wires up shared infrastructure."""
     init_database()
+    default_user = ensure_default_user()
+    seed_backend_connections(default_user.id)
     with suppress(Exception):
         _ensure_index(redis_sync, 384)
     try:

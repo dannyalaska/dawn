@@ -7,9 +7,14 @@ from typing import Any, TypedDict
 from langgraph.graph import END, StateGraph
 from sqlalchemy import select
 
+from app.core.backend_connectors import (
+    BackendConnectorError,
+    get_schema_grants,
+    list_backend_tables,
+)
 from app.core.chat_graph import run_chat
 from app.core.db import session_scope
-from app.core.models import Feed, FeedVersion
+from app.core.models import BackendConnection, Feed, FeedDataset, FeedVersion
 from app.core.rag import Chunk, upsert_chunks
 
 __all__ = ["AgentRunError", "run_multi_agent_session"]
@@ -41,6 +46,7 @@ class AgentState(TypedDict, total=False):
     feed_version: int
     summary: dict[str, Any]
     plan: list[dict[str, Any]]
+    backend_sources: list[dict[str, Any]]
     tasks: list[AgentTask]
     completed: list[AgentResult]
     warnings: list[str]
@@ -99,7 +105,124 @@ def _load_feed_snapshot(feed_identifier: str, user_id: str) -> dict[str, Any]:
         }
 
 
-def _derive_plan(summary: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
+def _load_backend_sources(user_id: str) -> list[dict[str, Any]]:
+    numeric_user = _ensure_int_user_id(user_id)
+    with session_scope() as session:
+        connection_rows = (
+            session.execute(
+                select(BackendConnection).where(BackendConnection.user_id == numeric_user)
+            )
+            .scalars()
+            .all()
+        )
+        dataset_rows = session.execute(
+            select(FeedDataset, Feed)
+            .join(Feed, FeedDataset.feed_id == Feed.id)
+            .where(Feed.user_id == numeric_user)
+        ).all()
+        connections = [
+            {
+                "id": conn.id,
+                "name": conn.name,
+                "kind": conn.kind,
+                "config": dict(conn.config or {}),
+            }
+            for conn in connection_rows
+        ]
+        datasets = [
+            {
+                "id": dataset.id,
+                "table_name": dataset.table_name,
+                "schema_name": dataset.schema_name,
+                "columns": list(dataset.columns or []),
+                "feed_identifier": feed.identifier,
+                "feed_version_id": dataset.feed_version_id,
+                "feed_name": feed.name,
+            }
+            for dataset, feed in dataset_rows
+        ]
+
+    sources: list[dict[str, Any]] = []
+    for connection in connections:
+        config = connection["config"]
+        schemas = get_schema_grants(config)
+        if not schemas:
+            continue
+        try:
+            table_rows = list_backend_tables(connection["kind"], config, schemas)
+        except BackendConnectorError as exc:
+            sources.append(
+                {
+                    "id": connection["id"],
+                    "name": connection["name"],
+                    "kind": connection["kind"],
+                    "schemas": schemas,
+                    "schema_details": [],
+                    "error": str(exc),
+                }
+            )
+            continue
+        tables_by_schema: dict[str, list[dict[str, Any]]] = {}
+        for row in table_rows:
+            schema_name = row.get("schema")
+            if not schema_name:
+                continue
+            tables_by_schema.setdefault(schema_name, []).append(
+                {
+                    "name": row.get("table"),
+                    "columns": row.get("columns", []),
+                }
+            )
+        schema_details: list[dict[str, Any]] = []
+        for schema_name in schemas:
+            schema_details.append(
+                {
+                    "name": schema_name,
+                    "tables": tables_by_schema.get(schema_name, []),
+                }
+            )
+        sources.append(
+            {
+                "id": connection["id"],
+                "name": connection["name"],
+                "kind": connection["kind"],
+                "schemas": schemas,
+                "schema_details": schema_details,
+                "error": None,
+            }
+        )
+
+    for dataset in datasets:
+        schema_name = dataset["schema_name"] or "public"
+        sources.append(
+            {
+                "id": f"feed_dataset:{dataset['id']}",
+                "name": f"{dataset['feed_identifier']} v{dataset['feed_version_id']}",
+                "kind": "feed_table",
+                "schemas": [schema_name],
+                "schema_details": [
+                    {
+                        "name": schema_name,
+                        "tables": [
+                            {
+                                "name": dataset["table_name"],
+                                "columns": dataset["columns"],
+                            }
+                        ],
+                    }
+                ],
+                "error": None,
+            }
+        )
+    return sources
+
+
+def _derive_plan(
+    summary: dict[str, Any],
+    *,
+    limit: int,
+    backend_sources: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     raw_plan = summary.get("analysis_plan") or []
     if not isinstance(raw_plan, list):
         raw_plan = []
@@ -111,32 +234,59 @@ def _derive_plan(summary: dict[str, Any], *, limit: int) -> list[dict[str, Any]]
         if len(plan) >= limit:
             break
 
-    if plan:
-        return plan
+    if not plan:
+        insights = summary.get("insights") or {}
+        if isinstance(insights, dict):
+            for column in insights:
+                plan.append({"type": "count_by", "column": column})
+                if len(plan) >= limit:
+                    break
 
-    insights = summary.get("insights") or {}
-    if isinstance(insights, dict):
-        for column in insights:
-            plan.append({"type": "count_by", "column": column})
+    if not plan:
+        aggregates = summary.get("aggregates") or []
+        if isinstance(aggregates, list):
+            for agg in aggregates:
+                if not isinstance(agg, dict):
+                    continue
+                plan.append(
+                    {
+                        "type": agg.get("stat", "avg_by"),
+                        "group": agg.get("group"),
+                        "value": agg.get("value"),
+                        "stat": agg.get("stat", "mean"),
+                    }
+                )
+                if len(plan) >= limit:
+                    break
+
+    if backend_sources:
+        plan = _extend_plan_with_backends(plan, backend_sources, limit=limit)
+
+    return plan
+
+
+def _extend_plan_with_backends(
+    plan: list[dict[str, Any]], backend_sources: list[dict[str, Any]], *, limit: int
+) -> list[dict[str, Any]]:
+    for source in backend_sources:
+        schema_details = source.get("schema_details") or []
+        if not schema_details and source.get("schemas"):
+            schema_details = [{"name": name} for name in source.get("schemas", [])]
+        for schema in schema_details:
             if len(plan) >= limit:
                 return plan
-
-    aggregates = summary.get("aggregates") or []
-    if isinstance(aggregates, list):
-        for agg in aggregates:
-            if not isinstance(agg, dict):
+            schema_name = schema.get("name")
+            if not schema_name:
                 continue
             plan.append(
                 {
-                    "type": agg.get("stat", "avg_by"),
-                    "group": agg.get("group"),
-                    "value": agg.get("value"),
-                    "stat": agg.get("stat", "mean"),
+                    "type": "schema_inventory",
+                    "schema": schema_name,
+                    "connection_id": source.get("id"),
+                    "connection_name": source.get("name"),
+                    "kind": source.get("kind"),
                 }
             )
-            if len(plan) >= limit:
-                break
-
     return plan
 
 
@@ -149,6 +299,9 @@ def _task_description(entry: dict[str, Any]) -> str:
             f"Aggregate {entry.get('value', '?')} by {entry.get('group', '?')} "
             f"({entry.get('stat', 'mean')})"
         )
+    if task_type == "schema_inventory":
+        conn = entry.get("connection_name") or entry.get("kind") or "connection"
+        return f"Inventory schema {entry.get('schema', '?')} on {conn}"
     return f"Execute plan step: {task_type}"
 
 
@@ -175,6 +328,7 @@ def _execute_task(
     task: AgentTask,
     *,
     summary: dict[str, Any],
+    backend_sources: list[dict[str, Any]],
 ) -> tuple[AgentResult | None, list[str]]:
     warnings: list[str] = []
     task_type = task.get("type")
@@ -183,24 +337,7 @@ def _execute_task(
 
     if task_type == "count_by":
         column = str(payload.get("column"))
-        counts: list[dict[str, Any]] = []
-        insights = summary.get("insights") or {}
-        if isinstance(insights, dict):
-            raw_counts = insights.get(column) or []
-            if isinstance(raw_counts, list):
-                counts = [c for c in raw_counts if isinstance(c, dict)]
-        if not counts:
-            metrics = summary.get("metrics") or []
-            for metric in metrics:
-                if (
-                    isinstance(metric, dict)
-                    and metric.get("type") == "value_counts"
-                    and metric.get("column") == column
-                ):
-                    raw_values = metric.get("values") or []
-                    if isinstance(raw_values, list):
-                        counts = [c for c in raw_values if isinstance(c, dict)]
-                    break
+        counts = _column_counts(summary, column)
         if counts:
             result = AgentResult(
                 task_id=task["id"],
@@ -215,14 +352,7 @@ def _execute_task(
         group = str(payload.get("group"))
         value = str(payload.get("value"))
         stat = str(payload.get("stat", "mean"))
-        aggregates = summary.get("aggregates") or []
-        aggregate_match = None
-        for agg in aggregates:
-            if not isinstance(agg, dict):
-                continue
-            if agg.get("group") == group and agg.get("value") == value:
-                aggregate_match = agg
-                break
+        aggregate_match = _aggregate_stats(summary, group, value)
         if aggregate_match:
             result = AgentResult(
                 task_id=task["id"],
@@ -239,15 +369,160 @@ def _execute_task(
         else:
             warnings.append(f"No aggregate metrics found for {value!r} by {group!r}.")
 
+    elif task_type == "schema_inventory":
+        result, warning = _execute_schema_inventory(task, backend_sources=backend_sources)
+        if warning:
+            warnings.append(warning)
+
     else:
+        fallback_data, fallback_warning = _fallback_tooling(task_type or "task", payload, summary)
         result = AgentResult(
             task_id=task["id"],
             type=task_type or "task",
             description=task["description"],
-            data={"note": "Task type not recognized; no execution performed."},
+            data=fallback_data,
         )
+        if fallback_warning:
+            warnings.append(fallback_warning)
 
     return result, warnings
+
+
+def _fallback_tooling(
+    task_type: str, payload: dict[str, Any], summary: dict[str, Any]
+) -> tuple[dict[str, Any], str]:
+    column_name = str(payload.get("column") or payload.get("target") or "").strip()
+    columns = summary.get("columns") or []
+    if column_name:
+        for column in columns:
+            if isinstance(column, dict) and str(column.get("name")) == column_name:
+                profile = {
+                    "dtype": column.get("dtype"),
+                    "top_values": column.get("top_values"),
+                    "stats": column.get("stats"),
+                }
+                return (
+                    {
+                        "column": column_name,
+                        "profile": profile,
+                        "payload": payload,
+                        "source": "column_profile",
+                    },
+                    f"Used column profile for task {task_type!r}.",
+                )
+    relationships = summary.get("relationships")
+    if column_name and isinstance(relationships, dict) and column_name in relationships:
+        return (
+            {
+                "column": column_name,
+                "relationship": relationships[column_name],
+                "payload": payload,
+                "source": "relationships",
+            },
+            f"Used relationship hints for task {task_type!r}.",
+        )
+    summary_text = summary.get("text")
+    if isinstance(summary_text, str) and summary_text.strip():
+        return (
+            {
+                "note": summary_text.strip()[:400],
+                "payload": payload,
+                "source": "dataset_summary",
+            },
+            f"Used dataset summary for task {task_type!r}.",
+        )
+    return (
+        {
+            "note": f"No structured data available for task {task_type!r}.",
+            "payload": payload,
+            "source": "fallback",
+        },
+        f"No structured data available for task {task_type!r}.",
+    )
+
+
+def _execute_schema_inventory(
+    task: AgentTask,
+    *,
+    backend_sources: list[dict[str, Any]],
+) -> tuple[AgentResult | None, str | None]:
+    payload = task.get("payload") or {}
+    connection_id = payload.get("connection_id")
+    schema_name = str(payload.get("schema") or "").strip()
+    if not connection_id or not schema_name:
+        return None, "Schema inventory payload is incomplete."
+    source = next((item for item in backend_sources if item.get("id") == connection_id), None)
+    if source is None:
+        return None, f"Backend connection {connection_id!r} not available."
+    if source.get("error"):
+        result = AgentResult(
+            task_id=task["id"],
+            type="schema_inventory",
+            description=task["description"],
+            data={
+                "connection": source.get("name"),
+                "schema": schema_name,
+                "error": source.get("error"),
+            },
+        )
+        return result, None
+    schema_details = next(
+        (item for item in source.get("schema_details", []) if item.get("name") == schema_name),
+        None,
+    )
+    tables = (schema_details or {}).get("tables") or []
+    preview = [
+        {"table": entry.get("name"), "columns": (entry.get("columns") or [])[:6]}
+        for entry in tables[:5]
+        if entry.get("name")
+    ]
+    result = AgentResult(
+        task_id=task["id"],
+        type="schema_inventory",
+        description=task["description"],
+        data={
+            "connection": source.get("name"),
+            "kind": source.get("kind"),
+            "schema": schema_name,
+            "tables": preview,
+            "table_count": len(tables),
+        },
+    )
+    return result, None
+
+
+def _column_counts(summary: dict[str, Any], column: str) -> list[dict[str, Any]]:
+    def _normalise(raw: Any) -> list[dict[str, Any]]:
+        if isinstance(raw, list):
+            return [c for c in raw if isinstance(c, dict)]
+        return []
+
+    insights = summary.get("insights") or {}
+    if isinstance(insights, dict):
+        counts = _normalise(insights.get(column))
+        if counts:
+            return counts
+
+    metrics = summary.get("metrics") or []
+    for metric in metrics:
+        if (
+            isinstance(metric, dict)
+            and metric.get("type") == "value_counts"
+            and metric.get("column") == column
+        ):
+            return _normalise(metric.get("values"))
+
+    return []
+
+
+def _aggregate_stats(summary: dict[str, Any], group: str, value: str) -> dict[str, Any] | None:
+    aggregates = summary.get("aggregates") or []
+    for aggregate in aggregates:
+        if not isinstance(aggregate, dict):
+            continue
+        if aggregate.get("group") == group and aggregate.get("value") == value:
+            return aggregate
+    return None
 
 
 def _summarise_result(result: AgentResult) -> str:
@@ -275,6 +550,22 @@ def _summarise_result(result: AgentResult) -> str:
             if isinstance(row, dict)
         )
         return f"{stat} {group}: best [{best_txt}] | worst [{worst_txt}]"
+    if result.get("type") == "schema_inventory":
+        schema = data.get("schema")
+        connection = data.get("connection")
+        error = data.get("error")
+        if error:
+            return f"{schema} on {connection}: {error}"
+        tables = data.get("tables") or []
+        if tables:
+            formatted = ", ".join(
+                f"{entry.get('table')} ({', '.join(entry.get('columns') or [])})"
+                for entry in tables[:3]
+                if entry.get("table")
+            )
+        else:
+            formatted = "no tables discovered"
+        return f"{schema} on {connection}: {formatted}"
     note = data
     return f"{result.get('description')}: {note}"
 
@@ -292,6 +583,7 @@ def _compiled_graph() -> Any:
 
     def bootstrap_node(state: AgentState) -> dict[str, Any]:
         snapshot = _load_feed_snapshot(state["feed_identifier"], state["user_id"])
+        backend_sources = state.get("backend_sources", [])
         messages = [
             *state.get("messages", []),
             {
@@ -306,18 +598,24 @@ def _compiled_graph() -> Any:
             "agent": "bootstrap",
             "message": "Feed summary loaded.",
             "feed_version": snapshot["feed_version"],
+            "backend_sources": len(backend_sources),
         }
         return {
             "feed_name": snapshot["feed_name"],
             "feed_version": snapshot["feed_version"],
             "summary": snapshot["summary"],
+            "backend_sources": backend_sources,
             "messages": messages,
             "run_log": [*state.get("run_log", []), log_entry],
         }
 
     def planner_node(state: AgentState) -> dict[str, Any]:
         summary = state.get("summary", {})
-        plan = _derive_plan(summary, limit=state.get("max_plan_steps", 12))
+        plan = _derive_plan(
+            summary,
+            limit=state.get("max_plan_steps", 12),
+            backend_sources=state.get("backend_sources", []),
+        )
         tasks = _build_tasks(plan, existing=state.get("tasks"))
         log_entry = {
             "agent": "planner",
@@ -331,10 +629,15 @@ def _compiled_graph() -> Any:
 
     def executor_node(state: AgentState) -> dict[str, Any]:
         summary = state.get("summary", {})
+        backend_sources = state.get("backend_sources", [])
         completed = list(state.get("completed", []))
         warnings = list(state.get("warnings", []))
         for task in state.get("tasks", []):
-            result, task_warnings = _execute_task(task, summary=summary)
+            result, task_warnings = _execute_task(
+                task,
+                summary=summary,
+                backend_sources=backend_sources,
+            )
             warnings.extend(task_warnings)
             if result:
                 completed.append(result)
@@ -498,6 +801,8 @@ def run_multi_agent_session(
     """Execute the multi-agent workflow and return the final agent state."""
     if not feed_identifier:
         raise AgentRunError("feed_identifier is required.")
+    backend_sources = _load_backend_sources(user_id)
+
     initial_state: AgentState = {
         "user_id": user_id,
         "feed_identifier": feed_identifier,
@@ -508,6 +813,7 @@ def run_multi_agent_session(
         "messages": [],
         "run_log": [],
         "context_updates": [],
+        "backend_sources": backend_sources,
         "refresh_context": refresh_context,
         "question": question or "",
         "answer": "",

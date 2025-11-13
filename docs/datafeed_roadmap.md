@@ -14,11 +14,13 @@ graph LR
         JOBS[/FastAPI `/jobs`/]
         NLSQL[/FastAPI `/nl/sql`/]
         RAGAPI[/FastAPI `/rag`/]
+        AGENTS[/FastAPI `/agents/analyze`/]
     end
 
     subgraph Orchestration
         RUNNER[Run Coordinator<br/>Jobs + Schedules]
         DQ[DQ Engine<br/>Auto + Manual Rules]
+        SWARM[LangGraph Agent Swarm<br/>Planner · Executor · Memory · QA]
     end
 
     subgraph Storage
@@ -38,6 +40,7 @@ graph LR
     ST --> JOBS
     ST --> NLSQL
     ST --> RAGAPI
+    ST --> AGENTS
 
     FEEDS --> PROFILE
     PROFILE --> PG
@@ -54,12 +57,16 @@ graph LR
     RUNNER --> PROFILE
     RUNNER --> DQ
     RUNNER --> REDIS
+    SWARM --> PG
+    SWARM --> REDIS
+    AGENTS --> SWARM
 
     TRANSFORMS --> PROFILE
     TRANSFORMS --> PG
 
     NLSQL --> REDIS
     NLSQL --> LLM
+    RAGAPI --> SWARM
 ```
 
 ## Feed Onboarding Flow
@@ -72,6 +79,7 @@ sequenceDiagram
     participant PROF as Profiling Engine
     participant DQ as DQ Rule Builder
     participant DOC as Docs & Embeddings
+    participant SWARM as Agent Swarm
     participant DB as Postgres / Redis
 
     U->>UI: Select source + upload / link
@@ -84,6 +92,8 @@ sequenceDiagram
     API-->>UI: Return version summary, docs, metrics
     UI-->>U: Show progress → summary cards → next steps
     UI->>JOBS: (Optional) create schedule + job record
+    UI->>SWARM: (Optional) trigger /agents/analyze for insights
+    SWARM->>DB: Persist metric summaries + memory updates
 ```
 
 ## Run Lifecycle & Drift Intelligence
@@ -105,7 +115,7 @@ flowchart LR
     REPORT -->|Store timeline, manifest| REDIS
     DQCHECK --> PG
     EMBEDNew --> REDIS
-    JOB --> NLQ{NL-to-SQL & Chat}
+    JOB --> NLQ{NL-to-SQL · Agent Swarm · Chat}
     NLQ -->|Use schema + drift summary| REDIS
 ```
 
@@ -119,16 +129,17 @@ flowchart LR
 - [x] Persist manifest, ER diagram, and profiling stats in Redis/Postgres.
 
 ### Sprint 2 — Connectors, Scheduling & NL Querying
-- Source connectors (S3, shared folder watch, Snowflake).
-- Credential management + connection tests.
-- Job scheduling UI (cron presets, manual runs, notifications).
-- Row embeddings + Redis vector index per feed.
-- NL-to-SQL enhancements with context-aware question suggestions.
-- Iterate on the tabbed Streamlit experience (Upload & Preview, Context & Memory, Ask Dawn).
-- Unified data access layer (feeds + ad-hoc uploads) powering both workspaces.
-- Feed export planner with manifest-driven targets (S3 + local outbox initial).
-- Export configuration UI (target selection, format, schedule, notifications).
-- Integrate exports into job runs with logging/alerting.
+- [x] Row embeddings + Redis vector index per feed.
+- [x] NL-to-SQL enhancements with context-aware question suggestions.
+- [x] Iterate on the tabbed Streamlit experience (Upload & Preview, Context & Memory, **Agent Swarm**, Ask Dawn).
+- [x] Expose multi-agent `/agents/analyze` endpoint for automated plan execution.
+- [ ] Source connectors (S3, shared folder watch, Snowflake).
+- [ ] Credential management + connection tests.
+- [ ] Job scheduling UI (cron presets, manual runs, notifications).
+- [ ] Unified data access layer (feeds + ad-hoc uploads) powering both workspaces.
+- [ ] Feed export planner with manifest-driven targets (S3 + local outbox initial).
+- [ ] Export configuration UI (target selection, format, schedule, notifications).
+- [ ] Integrate exports into job runs with logging/alerting.
 
 ### Sprint 3 — Automation & Intelligence
 - Drift timeline view & daily report cards.
@@ -158,3 +169,4 @@ flowchart LR
 - [ ] Add manual job trigger endpoints
 - [ ] Test scheduled execution end-to-end
 - [ ] Extend indexing UI with schedule configuration hooks
+- [x] Document Agent Swarm workflow & monitoring in README/User Guide

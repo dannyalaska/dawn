@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from collections.abc import Iterable
 from datetime import date, datetime
 from difflib import SequenceMatcher
@@ -13,10 +15,10 @@ import pandas as pd
 import requests
 from sqlalchemy import func, select
 
-from app.core.db import session_scope
+from app.core.db import get_engine, session_scope
 from app.core.dq import sync_auto_rules
 from app.core.excel.summary import ColumnSummary, DatasetMetric, summarize_dataframe
-from app.core.models import Feed, FeedVersion
+from app.core.models import Feed, FeedDataset, FeedVersion
 from app.core.rag import Chunk, simple_chunker, upsert_chunks
 from app.core.redis_client import redis_sync
 from app.core.storage import bucket_name, s3
@@ -28,6 +30,8 @@ class FeedIngestError(Exception):
 
 FEED_SOURCE_KINDS = {"upload", "s3", "http"}
 DATA_FORMATS = {"excel", "csv"}
+MAX_DATASET_ROWS = int(os.getenv("DAWN_MAX_DATASET_ROWS", "200000"))
+DATASET_TABLE_PREFIX = "dawn_feed_"
 
 
 def _infer_format(filename: str | None, declared: str | None) -> str:
@@ -123,6 +127,92 @@ def _collect_existing_columns(
                 continue
             seen.append({"feed_identifier": identifier, "column": name, "dtype": dtype})
     return seen
+
+
+def _dataset_table_name(identifier: str, version: int) -> str:
+    slug = re.sub(r"[^a-z0-9_]", "_", identifier.lower()).strip("_")
+    slug = slug or "feed"
+    table = f"{DATASET_TABLE_PREFIX}{slug}_v{version}"
+    return table[:60]
+
+
+def _dataset_info(dataset: FeedDataset) -> dict[str, Any]:
+    return {
+        "table": dataset.table_name,
+        "schema": dataset.schema_name,
+        "rows": dataset.row_count,
+        "columns": dataset.column_count,
+    }
+
+
+def _write_dataset_table(
+    df: pd.DataFrame,
+    *,
+    identifier: str,
+    version_number: int,
+) -> tuple[dict[str, Any], list[str]] | None:
+    if df.empty:
+        return None
+    if MAX_DATASET_ROWS > 0 and len(df) > MAX_DATASET_ROWS:
+        return None
+
+    table_name = _dataset_table_name(identifier, version_number)
+    engine = get_engine()
+    schema_name = getattr(engine.dialect, "default_schema_name", None)
+    safe_df = df.copy()
+    safe_df.columns = [str(col) for col in safe_df.columns]
+    safe_df.to_sql(
+        table_name,
+        con=engine,
+        if_exists="replace",
+        index=False,
+        chunksize=2000,
+    )
+    info = {
+        "table": table_name,
+        "schema": schema_name,
+        "rows": int(len(safe_df)),
+        "columns": int(len(safe_df.columns)),
+    }
+    return info, list(safe_df.columns)
+
+
+def _record_dataset(
+    *,
+    feed_id: int,
+    feed_version_id: int,
+    info: dict[str, Any],
+    columns: list[str],
+) -> dict[str, Any]:
+    with session_scope() as session:
+        FeedDataset.__table__.create(bind=session.get_bind(), checkfirst=True)
+        existing = (
+            session.execute(
+                select(FeedDataset).where(FeedDataset.feed_version_id == feed_version_id)
+            )
+            .scalars()
+            .first()
+        )
+        if existing:
+            return _dataset_info(existing)
+        dataset = FeedDataset(
+            feed_id=feed_id,
+            feed_version_id=feed_version_id,
+            table_name=info["table"],
+            schema_name=info.get("schema"),
+            storage="database",
+            columns=columns,
+            row_count=int(info.get("rows", 0)),
+            column_count=int(info.get("columns", len(columns))),
+        )
+        session.add(dataset)
+        version = session.get(FeedVersion, feed_version_id)
+        if version:
+            summary = dict(version.summary_json or {})
+            summary["materialized_table"] = info
+            version.summary_json = summary
+        session.flush()
+    return info
 
 
 def _looks_like_id(name: str) -> bool:
@@ -633,6 +723,9 @@ def ingest_feed(
 
     digest = sha256(raw_bytes).hexdigest()[:16]
 
+    materialized_table_info: dict[str, Any] | None = None
+    pending_dataset: dict[str, int] | None = None
+
     with session_scope() as s:
         feed = (
             s.execute(select(Feed).where(Feed.identifier == identifier, Feed.user_id == user_id))
@@ -735,6 +828,22 @@ def ingest_feed(
         feed_version.sha16 = digest
         feed_version.user_id = user_id
 
+        s.flush()
+
+        existing_dataset = (
+            s.execute(select(FeedDataset).where(FeedDataset.feed_version_id == feed_version.id))
+            .scalars()
+            .first()
+        )
+        if existing_dataset:
+            materialized_table_info = _dataset_info(existing_dataset)
+            summary_payload["materialized_table"] = materialized_table_info
+        else:
+            pending_dataset = {
+                "feed_id": feed.id,
+                "feed_version_id": feed_version.id,
+            }
+
         if er_diagram:
             summary_payload["mermaid"] = er_diagram
 
@@ -752,6 +861,22 @@ def ingest_feed(
         _chunk_summary(identifier, version_number, markdown_doc, user_id=user_id)
     except Exception as exc:  # noqa: BLE001
         print(f"[feed-ingest] chunk embedding failed: {exc}")
+
+    if pending_dataset:
+        write_result = _write_dataset_table(
+            df=df,
+            identifier=identifier,
+            version_number=version_number,
+        )
+        if write_result:
+            info, safe_columns = write_result
+            materialized_table_info = _record_dataset(
+                feed_id=pending_dataset["feed_id"],
+                feed_version_id=pending_dataset["feed_version_id"],
+                info=info,
+                columns=safe_columns,
+            )
+            summary_payload["materialized_table"] = materialized_table_info
 
     return {
         "feed": {
@@ -775,4 +900,5 @@ def ingest_feed(
         },
         "manifest": manifest,
         "drift": drift_payload,
+        "materialized_table": materialized_table_info,
     }

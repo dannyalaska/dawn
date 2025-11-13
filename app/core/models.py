@@ -75,6 +75,25 @@ class FeedVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class FeedDataset(Base):
+    __tablename__ = "feed_datasets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    feed_id: Mapped[int] = mapped_column(
+        ForeignKey("feeds.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    feed_version_id: Mapped[int] = mapped_column(
+        ForeignKey("feed_versions.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    table_name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    schema_name: Mapped[str | None] = mapped_column(String(128))
+    storage: Mapped[str] = mapped_column(String(32), default="database", nullable=False)
+    columns: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    column_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Transform(Base):
     __tablename__ = "transforms"
 

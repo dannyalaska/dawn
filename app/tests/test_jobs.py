@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 from io import BytesIO
 
 import pandas as pd
+from click.testing import CliRunner
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from app.cli import cli as dawn_cli
 from app.core.auth import ensure_default_user
 
 
@@ -106,3 +109,50 @@ def test_job_run_endpoint_creates_run_record():
             .all()
         )
         assert len(runs) == 1
+
+
+def _create_job_and_run(client: TestClient, name: str) -> None:
+    job_resp = client.post(
+        "/jobs",
+        json={
+            "name": name,
+            "feed_identifier": "tickets",
+            "transform_name": "tickets_clean",
+        },
+    )
+    assert job_resp.status_code == 200, job_resp.text
+    job_id = job_resp.json()["id"]
+    run_resp = client.post(f"/jobs/{job_id}/run")
+    assert run_resp.status_code == 200, run_resp.text
+
+
+def test_runner_meta_endpoint_reports_counts():
+    from app.api.server import app
+
+    client = TestClient(app)
+    _ingest_feed(client)
+    _create_transform(client)
+    _create_job_and_run(client, "tickets_job")
+
+    resp = client.get("/jobs/runner/meta")
+    assert resp.status_code == 200
+    stats = resp.json()
+    assert stats["jobs"]["total"] == 1
+    assert stats["runs"]["total"] == 1
+    assert stats["runs"]["last_run"]["status"] == "success"
+
+
+def test_runner_cli_stats(monkeypatch):
+    from app.api.server import app
+
+    client = TestClient(app)
+    _ingest_feed(client)
+    _create_transform(client)
+    _create_job_and_run(client, "tickets_cli_job")
+
+    runner = CliRunner()
+    result = runner.invoke(dawn_cli, ["runner", "stats", "--user-id", "1", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    stats = json.loads(result.output)
+    assert stats["jobs"]["total"] == 1
+    assert stats["runs"]["total"] == 1

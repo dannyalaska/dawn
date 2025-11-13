@@ -42,11 +42,28 @@ STATE_DEFAULTS: dict[str, Any] = {
     "user": None,
     "auth_error": None,
     "backend_cache": None,
+    "agent_feed_cache": None,
+    "agent_runs": [],
+    "agent_last_run": None,
+    "runner_meta": None,
 }
 
 
 def _rerun() -> None:
     cast(Any, st).experimental_rerun()
+
+
+def _is_embed_mode() -> bool:
+    params = st.query_params
+    raw = params.get("embed") if isinstance(params, dict) else None
+    if isinstance(raw, list):
+        embed = (raw[0] if raw else "").lower()
+    elif isinstance(raw, str):
+        embed = raw.lower()
+    else:
+        embed = ""
+    env_embed = os.getenv("DAWN_EMBED", "").lower()
+    return embed in {"1", "true", "runner"} or env_embed in {"1", "true", "runner"}
 
 
 LLM_OPTIONS = [
@@ -71,20 +88,41 @@ class ServiceStatus:
 
 def main() -> None:
     _init_state()
+    embed_mode = _is_embed_mode()
     _ensure_authenticated()
     health = _fetch_health()
+    runner_meta = _fetch_runner_meta()
+    st.session_state["runner_meta"] = runner_meta
+
+    if embed_mode:
+        _render_runner_tab(embedded=True)
+        return
+
     _render_sidebar(health)
     _render_header()
 
-    tabs = st.tabs(["Upload & Preview", "Context & Memory", "Ask Dawn", "Backend Settings"])
+    tabs = st.tabs(
+        [
+            "Upload & Preview",
+            "Context & Memory",
+            "Agent Swarm",
+            "Ask Dawn",
+            "Backend Settings",
+            "Runner Dashboard",
+        ]
+    )
     with tabs[0]:
         _render_preview_tab()
     with tabs[1]:
         _render_context_tab()
     with tabs[2]:
-        _render_ask_tab()
+        _render_agents_tab()
     with tabs[3]:
+        _render_ask_tab()
+    with tabs[4]:
         _render_backend_settings_tab()
+    with tabs[5]:
+        _render_runner_tab()
 
 
 def _init_state() -> None:
@@ -452,6 +490,86 @@ def _render_context_tab() -> None:
         _add_context_note(note_text.strip())
 
 
+def _render_agents_tab() -> None:
+    st.subheader("Agent Swarm")
+    feed_cache = _ensure_agent_feeds()
+    with st.expander("Available feeds", expanded=False):
+        if st.button("Reload feed list", key="agent_reload_feeds", use_container_width=True):
+            feed_cache = _ensure_agent_feeds(force_refresh=True)
+        if feed_cache:
+            for feed in feed_cache[:6]:
+                latest = feed.get("latest_version") or {}
+                name = feed.get("name", feed["identifier"])
+                version = latest.get("number", "—")
+                rows = latest.get("rows", 0) or 0
+                st.write(f"- **{name}** (`{feed['identifier']}`) — v{version}, {rows} rows")
+
+    if not feed_cache:
+        st.info(
+            "Index a dataset first—agents depend on stored summaries. "
+            "Once a feed exists, reload the list above."
+        )
+        return
+
+    selected_feed = st.selectbox(
+        "Select feed",
+        options=feed_cache,
+        format_func=lambda feed: f"{feed.get('name', feed['identifier'])} ({feed['identifier']})",
+        key="agent_feed_choice",
+    )
+    question = st.text_area(
+        "Optional question for QA agent",
+        placeholder="Who resolved the most tickets last week?",
+        key="agent_question",
+        height=120,
+    )
+    col_opts = st.columns(3)
+    refresh_context = col_opts[0].toggle(
+        "Refresh context memory", value=True, key="agent_refresh_toggle"
+    )
+    max_plan = col_opts[1].slider(
+        "Max plan steps", min_value=3, max_value=20, value=12, key="agent_plan_steps"
+    )
+    retrieval_k = col_opts[2].slider(
+        "Retrieval k", min_value=3, max_value=12, value=6, key="agent_retrieval_k"
+    )
+
+    run_button = st.button("Run agents", use_container_width=True, key="agent_run_button")
+    if run_button and selected_feed:
+        payload = {
+            "feed_identifier": selected_feed["identifier"],
+            "question": question.strip() or None,
+            "refresh_context": refresh_context,
+            "max_plan_steps": max_plan,
+            "retrieval_k": retrieval_k,
+        }
+        try:
+            with st.spinner("Coordinating multi-agent workflow…"):
+                result = _trigger_agent_run(payload)
+        except APIError as exc:
+            st.error(f"Agent run failed: {exc}")
+        else:
+            result["requested_at"] = _timestamp()
+            st.session_state["agent_last_run"] = result
+            history = [result, *st.session_state.get("agent_runs", [])]
+            st.session_state["agent_runs"] = history[:5]
+            st.toast("Agent run complete.", icon="🤖")
+
+    last_run = st.session_state.get("agent_last_run")
+    if not last_run:
+        st.caption("Run the agents to see plan steps, outputs, and QA answers.")
+        return
+
+    _render_agent_run(last_run)
+
+    history = st.session_state.get("agent_runs") or []
+    if len(history) > 1:
+        st.markdown("##### Recent runs")
+        for run in history[1:]:
+            label = run.get("requested_at", "unknown time")
+            st.write(f"- {run.get('feed_identifier', 'unknown')} @ {label} — {run.get('status')}")
+
+
 def _render_ask_tab() -> None:
     st.subheader("Ask Dawn")
 
@@ -732,6 +850,32 @@ def _render_backend_settings_tab() -> None:
                     key=f"backend_config_{connection['id']}",
                     height=180,
                 )
+                grants_text = "\n".join(connection.get("schema_grants") or [])
+                grants_input = st.text_area(
+                    "Schema grants (one per line)",
+                    value=grants_text,
+                    key=f"backend_schema_grants_{connection['id']}",
+                    height=120,
+                    help="Restrict agent access to specific schemas. Applies to Postgres and Snowflake.",
+                )
+                if st.button(
+                    "List available schemas",
+                    key=f"backend_schema_list_{connection['id']}",
+                ):
+                    try:
+                        schema_resp = _request_json(
+                            "get",
+                            f"/backends/{connection['id']}/schemas",
+                            timeout=12,
+                        )
+                    except APIError as exc:
+                        st.error(f"Failed to list schemas: {exc}")
+                    else:
+                        schemas = schema_resp.get("schemas") or []
+                        if schemas:
+                            st.success(f"Available schemas: {', '.join(schemas)}")
+                        else:
+                            st.info("No schemas returned for this connection.")
                 col_save, col_delete = st.columns(2)
                 if col_save.button("Save changes", key=f"backend_save_{connection['id']}"):
                     if not name_input.strip():
@@ -742,11 +886,16 @@ def _render_backend_settings_tab() -> None:
                         except json.JSONDecodeError as exc:
                             st.error(f"Invalid JSON: {exc}")
                         else:
+                            schema_grants = _parse_schema_grants_input(grants_input)
                             try:
                                 _request_json(
                                     "put",
                                     f"/backends/{connection['id']}",
-                                    json={"name": name_input.strip(), "config": config_payload},
+                                    json={
+                                        "name": name_input.strip(),
+                                        "config": config_payload,
+                                        "schema_grants": schema_grants,
+                                    },
                                     timeout=10,
                                 )
                                 st.success("Connection updated")
@@ -766,12 +915,19 @@ def _render_backend_settings_tab() -> None:
     st.subheader("Add Connection")
     with st.form("backend_create_form"):
         name = st.text_input("Name", key="backend_new_name")
-        kind = st.selectbox("Kind", ("postgres", "mysql", "s3"), key="backend_new_kind")
+        kind = st.selectbox(
+            "Kind", ("postgres", "mysql", "s3", "snowflake"), key="backend_new_kind"
+        )
         config_text = st.text_area(
             "Configuration (JSON)",
             value="{}",
             key="backend_new_config",
             height=180,
+        )
+        grants_text = st.text_area(
+            "Schema grants (optional, one per line)",
+            key="backend_new_grants",
+            height=100,
         )
         submitted = st.form_submit_button("Save connection", width="stretch")
         if submitted:
@@ -783,12 +939,63 @@ def _render_backend_settings_tab() -> None:
                 except json.JSONDecodeError as exc:
                     st.error(f"Invalid JSON: {exc}")
                 else:
+                    schema_grants = _parse_schema_grants_input(grants_text)
                     try:
-                        _create_backend_connection(name.strip(), kind, config_payload)
+                        _create_backend_connection(
+                            name.strip(),
+                            kind,
+                            config_payload,
+                            schema_grants=schema_grants,
+                        )
                         st.success("Connection saved")
                         _rerun()
                     except APIError as exc:
                         st.error(f"Failed to save connection: {exc}")
+
+
+def _render_runner_tab(embedded: bool = False) -> None:
+    meta = st.session_state.get("runner_meta") or {}
+    jobs = meta.get("jobs") or {}
+    runs = meta.get("runs") or {}
+    st.subheader("Runner Dashboard")
+    if not meta:
+        st.info("Runner stats unavailable. Ensure you're authenticated and try again.")
+        if st.button("Retry"):
+            _rerun()
+        return
+
+    col_jobs, col_active, col_runs = st.columns(3)
+    col_jobs.metric("Jobs", jobs.get("total", 0), f"scheduled {jobs.get('scheduled', 0)}")
+    col_active.metric("Active jobs", jobs.get("active", 0))
+    col_runs.metric("Runs", runs.get("total", 0), f"success {runs.get('success', 0)}")
+
+    col_success, col_failed = st.columns(2)
+    col_success.metric("Successful runs", runs.get("success", 0))
+    col_failed.metric("Failed runs", runs.get("failed", 0))
+
+    last_run = runs.get("last_run") or {}
+    st.markdown("##### Last run")
+    if last_run.get("status"):
+        st.write(
+            f"- Status: **{last_run['status']}**\n"
+            f"- Finished at: {last_run.get('finished_at') or 'n/a'}\n"
+            f"- Duration: {last_run.get('duration_seconds') or 'n/a'}s"
+        )
+    else:
+        st.write("No runs recorded yet.")
+
+    if not embedded:
+        st.divider()
+        st.markdown("##### Embed in portal")
+        app_url = os.getenv("DAWN_APP_URL", "http://127.0.0.1:8501")
+        iframe_url = f"{app_url.rstrip('/')}/?embed=runner"
+        snippet = (
+            f'<iframe src="{iframe_url}" width="100%" height="640" frameborder="0" '
+            f'allow="clipboard-write; clipboard-read"></iframe>'
+        )
+        st.code(snippet, language="html")
+        if st.button("Refresh stats"):
+            _rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +1082,102 @@ def _fetch_recent_uploads() -> list[dict[str, Any]]:
     return []
 
 
+def _fetch_feeds_index() -> list[dict[str, Any]]:
+    data = _request_json("get", "/feeds", timeout=10)
+    if isinstance(data, dict):
+        feeds = data.get("feeds")
+        if isinstance(feeds, list):
+            return feeds
+    return []
+
+
+def _trigger_agent_run(payload: dict[str, Any]) -> dict[str, Any]:
+    return _request_json("post", "/agents/analyze", json=payload, timeout=120)
+
+
+def _ensure_agent_feeds(*, force_refresh: bool = False) -> list[dict[str, Any]]:
+    cache_key = "agent_feed_cache"
+    if force_refresh or cache_key not in st.session_state or st.session_state[cache_key] is None:
+        try:
+            feeds = _fetch_feeds_index()
+        except APIError as exc:
+            st.error(f"Unable to load feeds: {exc}")
+            feeds = []
+        if feeds:
+            st.session_state[cache_key] = feeds
+            st.success(f"Loaded {len(feeds)} feeds.")
+        else:
+            st.session_state[cache_key] = []
+    return st.session_state.get(cache_key) or []
+
+
+def _render_agent_run(run: dict[str, Any]) -> None:
+    st.markdown("#### Latest run")
+    info_cols = st.columns(3)
+    info_cols[0].metric(
+        "Feed",
+        run.get("feed_identifier", "—"),
+        help=run.get("feed_name") or "Feed identifier",
+    )
+    info_cols[1].metric("Status", (run.get("status") or "unknown").upper())
+    info_cols[2].metric("Warnings", len(run.get("warnings") or []))
+    st.caption(f"Requested at {run.get('requested_at', _timestamp())}")
+
+    plan = run.get("plan") or []
+    if plan:
+        st.markdown("##### Planner output")
+        plan_rows = [
+            {"step": idx + 1, **entry} for idx, entry in enumerate(plan) if isinstance(entry, dict)
+        ]
+        st.dataframe(pd.DataFrame(plan_rows), use_container_width=True)
+
+    completed = run.get("completed") or []
+    if completed:
+        st.markdown("##### Executor results")
+        for result in completed:
+            st.markdown(f"**{result.get('description', result.get('type'))}**")
+            st.json(result.get("data", {}), expanded=False)
+
+    answer = run.get("answer")
+    if answer:
+        st.markdown("##### QA answer")
+        st.write(answer)
+        sources = run.get("answer_sources") or []
+        if sources:
+            st.caption("Sources")
+            st.json(sources, expanded=False)
+
+    context_updates = run.get("context_updates") or []
+    if context_updates:
+        st.markdown("##### Memory updates")
+        for update in context_updates[:10]:
+            st.write(f"- {update.get('text')}")
+
+    warnings = run.get("warnings") or []
+    if warnings:
+        st.warning("\n".join(str(msg) for msg in warnings))
+
+    final_report = run.get("final_report")
+    if final_report:
+        st.markdown("##### Final report")
+        st.code(final_report, language="markdown")
+
+    run_log = run.get("run_log") or []
+    if run_log:
+        st.markdown("##### Run log")
+        log_rows = [
+            {
+                "agent": entry.get("agent"),
+                "message": entry.get("message"),
+                "details": json.dumps(
+                    {k: v for k, v in entry.items() if k not in {"agent", "message"}}, indent=2
+                ),
+            }
+            for entry in run_log
+        ]
+        st.table(pd.DataFrame(log_rows))
+
+
 def _service_statuses(health: dict[str, Any] | None) -> list[ServiceStatus]:
     if not health:
         return [
@@ -923,13 +1226,38 @@ def _fetch_backend_connections() -> list[dict[str, Any]]:
     return []
 
 
-def _create_backend_connection(name: str, kind: str, config: dict[str, Any]) -> dict[str, Any]:
+def _fetch_runner_meta() -> dict[str, Any] | None:
+    try:
+        return _request_json("get", "/jobs/runner/meta", timeout=6)
+    except APIError:
+        return None
+
+
+def _create_backend_connection(
+    name: str, kind: str, config: dict[str, Any], *, schema_grants: list[str] | None = None
+) -> dict[str, Any]:
     payload = {"name": name, "kind": kind, "config": config}
+    if schema_grants:
+        payload["schema_grants"] = schema_grants
     return _request_json("post", "/backends", json=payload, timeout=10)
 
 
 def _delete_backend_connection(connection_id: int) -> None:
     _request_json("delete", f"/backends/{connection_id}", timeout=10)
+
+
+def _parse_schema_grants_input(raw_text: str | None) -> list[str]:
+    if not raw_text:
+        return []
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for line in raw_text.splitlines():
+        cleaned = line.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        ordered.append(cleaned)
+    return ordered
 
 
 def _persist_env_vars(updates: dict[str, str | None]) -> None:

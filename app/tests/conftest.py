@@ -5,6 +5,7 @@ from contextlib import suppress
 from typing import Any
 
 import pytest
+from sqlalchemy import text
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
@@ -122,4 +123,23 @@ def isolate_env(tmp_path, monkeypatch):
 
     ensure_default_user()
     yield
+    dataset_prefix = "dawn_feed_"
+    with eng.begin() as conn:
+        if eng.dialect.name == "sqlite":
+            rows = conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE :pattern"),
+                {"pattern": f"{dataset_prefix}%"},
+            ).fetchall()
+            for (name,) in rows:
+                conn.execute(text(f'DROP TABLE IF EXISTS "{name}"'))
+        else:
+            rows = conn.execute(
+                text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_name LIKE :pattern"
+                ),
+                {"pattern": f"{dataset_prefix}%"},
+            ).fetchall()
+            for (name,) in rows:
+                conn.execute(text(f'DROP TABLE IF EXISTS "{name}"'))
     Base.metadata.drop_all(bind=eng)

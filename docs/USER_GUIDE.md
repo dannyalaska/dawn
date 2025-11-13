@@ -120,6 +120,26 @@ Once a workbook is indexed it becomes the active context source for the session.
 
 ### Automation
 Job scheduling is still available through the REST API (see `docs/API_REFERENCE.md#/jobs`). The simplified Streamlit app focuses on manual previewing, context management, and retrieval QA.
+Need a quick health check? Call `GET /jobs/runner/meta` or run `python -m app.cli runner stats` to see job counts, success/fail tallies, and the timestamp of the last run.
+
+## Backend Connectors & Schema Grants
+
+Use the **Backend Settings** tab to register external systems:
+
+- **Postgres** and **Snowflake** connections support schema discovery. Enter your credentials, click **List available schemas**, and Dawn will verify access via the target database.
+- Add schemas (one per line) in the **Schema grants** box to restrict Dawn’s agents to approved namespaces. These grants are enforced whenever NL-to-SQL or agents plan against that backend.
+- **MySQL** and **S3** connectors remain available for credential storage even though schema grants do not apply.
+- Tip: if you set `POSTGRES_DSN` (or provide `BACKEND_AUTO_CONNECTIONS`) in `.env`, Dawn auto-seeds that connection for the default user so you can skip manual entry.
+
+Each connection belongs to the signed-in user and is stored locally in Postgres. When embedding Dawn inside another portal, issue user-scoped tokens so schema grants remain in effect.
+
+## Materialized Datasets
+
+Uploads aren’t just summarized—they’re materialized into local SQL tables so every agent can read the full dataset later.
+
+- During ingestion Dawn writes the entire CSV/Excel sheet into your configured database (default SQLite for dev, Postgres in production) and records metadata in `feed_datasets`.
+- NL2SQL and the multi-agent runner automatically treat those tables as data sources, so schema inventories and SQL generation work even without an external warehouse connector.
+- Set `DAWN_MAX_DATASET_ROWS` to cap how many rows are persisted if you only want smaller feeds stored locally.
 
 ---
 
