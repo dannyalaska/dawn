@@ -7,11 +7,9 @@ from typing import Any
 import psycopg2
 
 try:  # pragma: no cover - optional dependency
-    import snowflake.connector  # type: ignore
+    import snowflake.connector as snowflake_connector  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
-    snowflake = None
-else:  # pragma: no cover - optional dependency
-    snowflake = snowflake.connector
+    snowflake_connector = None  # type: ignore[assignment]
 
 
 class BackendConnectorError(Exception):
@@ -67,7 +65,7 @@ def _postgres_schemas(config: dict[str, Any]) -> list[str]:
 
 
 def _snowflake_schemas(config: dict[str, Any]) -> list[str]:
-    if snowflake is None:
+    if snowflake_connector is None:
         raise BackendConnectorError(
             "snowflake-connector-python is not installed. Install it to use Snowflake backends."
         )
@@ -89,7 +87,7 @@ def _snowflake_schemas(config: dict[str, Any]) -> list[str]:
     # Remove None values to avoid connector warnings.
     clean_kwargs = {k: v for k, v in connect_kwargs.items() if v}
 
-    ctx = snowflake.connect(**clean_kwargs)
+    ctx = snowflake_connector.connect(**clean_kwargs)
     cursor = ctx.cursor()
     try:
         cursor.execute("SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA ORDER BY SCHEMA_NAME")
@@ -198,7 +196,7 @@ def _postgres_table_rows(config: dict[str, Any], schemas: list[str]) -> list[tup
 
 
 def _snowflake_cursor(config: dict[str, Any]):
-    if snowflake is None:
+    if snowflake_connector is None:
         raise BackendConnectorError(
             "snowflake-connector-python is not installed. Install it to use Snowflake backends."
         )
@@ -216,7 +214,7 @@ def _snowflake_cursor(config: dict[str, Any]):
         "role": config.get("role"),
     }
     clean_kwargs = {k: v for k, v in connect_kwargs.items() if v}
-    return snowflake.connect(**clean_kwargs)
+    return snowflake_connector.connect(**clean_kwargs)
 
 
 def _snowflake_table_rows(config: dict[str, Any], schemas: list[str]) -> list[tuple[str, str, str]]:
