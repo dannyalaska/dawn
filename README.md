@@ -33,7 +33,7 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 
 | Layer | Responsibility |
 | --- | --- |
-| **Streamlit** | Three-tab workspace (Upload & Preview, Context & Memory, Ask Dawn) for profiling Excel files, curating context, and asking questions. |
+| **Next.js** | Dawn Horizon workspace for profiling Excel files, curating context, managing agents, and asking questions. |
 | **FastAPI** | `/ingest/preview`, `/rag/index_excel`, `/rag/context`, `/rag/memory`, `/rag/chat`, `/jobs`, etc. |
 | **pandas** | Profiling, counts, numeric stats, aggregation execution. |
 | **APScheduler** | Background job scheduling and execution for automated data processing. |
@@ -47,7 +47,7 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 ```mermaid
 flowchart TD
     subgraph UI
-        ST[Streamlit App\nUpload · Context · Agent Swarm · Ask]
+        NEXT[Next.js App\nUpload · Context · Agent Swarm · Ask]
     end
 
     subgraph API["FastAPI Service"]
@@ -79,11 +79,11 @@ flowchart TD
         STUB[Stub]
     end
 
-    ST -->|REST| FEEDS
-    ST -->|REST| RAG
-    ST -->|REST| AGENTS
-    ST -->|REST| NLSQL
-    ST -->|REST| JOBS
+    NEXT -->|REST| FEEDS
+    NEXT -->|REST| RAG
+    NEXT -->|REST| AGENTS
+    NEXT -->|REST| NLSQL
+    NEXT -->|REST| JOBS
 
     FEEDS --> INGEST
     RAG --> CHAT
@@ -122,6 +122,7 @@ flowchart TD
 - Poetry ≥ 2
 - Redis (redis-stack with RediSearch)
 - Postgres 13+
+- Node.js 18.18+
 - Optional: LM Studio or Ollama
 
 ### Start dependencies
@@ -151,9 +152,28 @@ cp .env.example .env
 ./start_dawn.sh
 ```
 - API → `http://127.0.0.1:8000`
-- Streamlit → `http://127.0.0.1:8501`
+- Next.js UI → `http://127.0.0.1:3000` (override with `DAWN_NEXT_PORT`)
 
-Open the Streamlit app and you’ll land on a simplified workspace:
+The startup script launches the cinematic **Dawn Horizon** Next.js workspace. It keeps the FastAPI
+process running, ensures the `web/` dependencies are installed, and boots `npm run dev` so you get hot reload,
+Three.js telemetry, animated agent cards, and the upload/auth widgets.
+
+### Working on the Next.js UI
+
+`web/` contains the experience built with Next 14, Tailwind, SWR, and `@react-three/fiber`. It requires Node.js 18.18+.
+
+```bash
+cd web
+npm install
+npm run dev   # http://localhost:3000
+```
+
+Env hints:
+
+- `NEXT_PUBLIC_DAWN_API` — URL for the FastAPI backend (defaults to `http://127.0.0.1:8000`)
+- `DAWN_NEXT_PORT=4000` — change the Next dev server port
+
+Key features:
 - **Upload & Preview** – profile an Excel workbook and review sample rows.
 - **Context & Memory** – inspect the captured context notes and add your own guidance.
 - **Ask Dawn** – run retrieval-augmented questions with instant suggestions.
@@ -161,7 +181,7 @@ Open the Streamlit app and you’ll land on a simplified workspace:
 - **Materialized Tables** – every upload becomes a local SQL table so agents and NL2SQL can query the full dataset later.
 - **Auto-Seeded Postgres** – if your `.env` supplies `POSTGRES_DSN` (or `BACKEND_AUTO_CONNECTIONS`), Dawn automatically registers that database as a backend connection for the default user so agents can query it immediately.
 
-Authentication is local-first: the app boots with a default account (`local@dawn.internal`). Use the **Account** panel in the sidebar to register new users, sign in, or manage tokens—each user keeps an isolated Redis/Postgres namespace.
+Authentication is local-first: the app boots with a default account (`local@dawn.internal`). Use the **Account** panel to register new users, sign in, or manage tokens—each user keeps an isolated Redis/Postgres namespace.
 
 ### Sample data
 - `demo_assets/support_copilot_demo.xlsx` — synthetic support tickets with agents + KPIs.
@@ -191,10 +211,10 @@ docker build -t dawn .
 Then run it, pointing Dawn at your own Postgres/Redis via `.env` (or explicit env vars):
 
 ```bash
-docker run --env-file .env -p 8000:8000 -p 8501:8501 dawn
+docker run --env-file .env -p 8000:8000 -p 3000:3000 dawn
 ```
 
-The entrypoint runs migrations and starts both FastAPI (`:8000`) and Streamlit (`:8501`). Provide database/redis credentials via environment so the container can reuse your existing infrastructure.
+The entrypoint runs migrations and starts both FastAPI (`:8000`) and Next.js (`:3000`). Provide database/redis credentials via environment so the container can reuse your existing infrastructure.
 
 ---
 
@@ -211,6 +231,10 @@ The entrypoint runs migrations and starts both FastAPI (`:8000`) and Streamlit (
 - **Next** – Assisted workbook editing (approve patches), SQL ingestion, and multi-workbook memory.
 
 ---
+
+
+
+
 
 ## Contributing
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -27,12 +28,15 @@ from redis.commands.search.index_definition import (  # type: ignore[import-unty
 from redis.commands.search.query import Query  # type: ignore[import-untyped]
 from redis.exceptions import ResponseError
 
-from app.core.redis_client import redis_sync
+from app.core.redis_client import redis_binary, redis_sync
 
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # 384-dim
 INDEX_NAME = "dawn:rag:index"
 PREFIX = "dawn:rag:doc:"
 VEC_FIELD = "embedding"
+LOGGER = logging.getLogger(__name__)
+_VECTOR_INDEX_SUPPORTED: bool | None = None
+_NO_SEARCH_WARNING_EMITTED = False
 
 
 @dataclass
@@ -63,7 +67,34 @@ def _doc_key(user_id: str, docid: str) -> str:
     return f"{PREFIX}{user_id}:{docid}"
 
 
+def _redis_supports_vector_index(redis: Redis) -> bool:
+    global _VECTOR_INDEX_SUPPORTED
+    if _VECTOR_INDEX_SUPPORTED is not None:
+        return _VECTOR_INDEX_SUPPORTED
+    try:
+        redis.execute_command("FT._LIST")
+        _VECTOR_INDEX_SUPPORTED = True
+    except ResponseError as exc:
+        message = str(exc).lower()
+        if "unknown command" in message or "err unknown command" in message:
+            _VECTOR_INDEX_SUPPORTED = False
+        else:
+            _VECTOR_INDEX_SUPPORTED = True
+    except Exception:
+        _VECTOR_INDEX_SUPPORTED = False
+    return bool(_VECTOR_INDEX_SUPPORTED)
+
+
 def _ensure_index(redis: Redis, dim: int = 384) -> None:
+    global _NO_SEARCH_WARNING_EMITTED
+    if not _redis_supports_vector_index(redis):
+        if not _NO_SEARCH_WARNING_EMITTED:
+            LOGGER.warning(
+                "Redis instance is missing RediSearch (FT.*) commands. Falling back to local "
+                "similarity search; install redis-stack for best performance."
+            )
+            _NO_SEARCH_WARNING_EMITTED = True
+        return
     required_fields = {
         "text",
         "source",
@@ -128,7 +159,20 @@ def _ensure_index(redis: Redis, dim: int = 384) -> None:
         ),
     ]
     definition = IndexDefinition(prefix=[PREFIX], index_type=IndexType.HASH)
-    redis.ft(INDEX_NAME).create_index(fields=schema, definition=definition)
+    try:
+        redis.ft(INDEX_NAME).create_index(fields=schema, definition=definition)
+    except ResponseError as exc:
+        message = str(exc).lower()
+        if "unknown command" in message or "err unknown command" in message:
+            _VECTOR_INDEX_SUPPORTED = False
+            if not _NO_SEARCH_WARNING_EMITTED:
+                LOGGER.warning(
+                    "Redis instance rejected FT.CREATE. Falling back to local similarity search; "
+                    "install redis-stack for vector indexing."
+                )
+                _NO_SEARCH_WARNING_EMITTED = True
+            return
+        raise
 
 
 def _escape_tag(value: str) -> str:
@@ -253,6 +297,9 @@ class RedisHashVectorStore(VectorStore):
         if vec.size != self.dim:
             raise ValueError(f"Embedding dim mismatch: expected {self.dim}, got {vec.size}")
 
+        if not _redis_supports_vector_index(self.redis):
+            return self._fallback_similarity_search(vec, k=k, filter=filter)
+
         _ensure_index(self.redis, self.dim)
         filter_clause = "*"
         if filter and filter.get("user_id"):
@@ -298,6 +345,92 @@ class RedisHashVectorStore(VectorStore):
             doc = Document(page_content=row.text, metadata=metadata)
             results.append((doc, float(row.score)))
         return results
+
+    def _fallback_similarity_search(
+        self, vec: np.ndarray, k: int, filter: dict[str, Any] | None = None
+    ) -> list[tuple[Document, float]]:
+        user_filter = str(filter.get("user_id")) if filter and filter.get("user_id") else None
+        pattern = f"{PREFIX}{user_filter}:*" if user_filter else f"{PREFIX}*"
+        results: list[tuple[Document, float]] = []
+        vec_norm = float(np.linalg.norm(vec)) or 1e-12
+
+        def _decode(value: Any) -> str | None:
+            if value is None:
+                return None
+            if isinstance(value, bytes):
+                try:
+                    return value.decode("utf-8")
+                except Exception:
+                    return value.decode("utf-8", errors="ignore")
+            return str(value)
+
+        for key in self.redis.scan_iter(match=pattern):
+            (
+                text_raw,
+                metadata_raw,
+                row_raw,
+                type_raw,
+                tags_raw,
+                source_raw,
+                column_name_raw,
+                vec_raw,
+            ) = redis_binary.hmget(
+                key,
+                "text",
+                "metadata",
+                "row_index",
+                "type",
+                "tags",
+                "source",
+                "column_name",
+                VEC_FIELD,
+            )
+            text_val = _decode(text_raw)
+            if not text_val or not vec_raw:
+                continue
+            chunk_vec = np.frombuffer(vec_raw, dtype=np.float32)
+            if chunk_vec.size != self.dim:
+                continue
+            chunk_norm = float(np.linalg.norm(chunk_vec)) or 1e-12
+            cosine = float(np.dot(vec, chunk_vec) / (vec_norm * chunk_norm))
+            score = 1 - cosine
+
+            metadata: dict[str, Any] = {}
+            metadata_str = _decode(metadata_raw)
+            if metadata_str:
+                try:
+                    metadata = json.loads(metadata_str)
+                except Exception:  # noqa: BLE001
+                    metadata = {}
+            source_val = _decode(source_raw)
+            if source_val and not metadata.get("source"):
+                metadata["source"] = source_val
+            if "row_index" in metadata:
+                try:
+                    metadata["row_index"] = int(metadata["row_index"])
+                except Exception:
+                    metadata["row_index"] = -1
+            else:
+                row_str = _decode(row_raw)
+                metadata["row_index"] = int(row_str or -1)
+            type_val = _decode(type_raw)
+            metadata["type"] = metadata.get("type") or type_val or "excel"
+            if tags_raw and not metadata.get("tags"):
+                tags_val = _decode(tags_raw) or ""
+                metadata["tags"] = [t for t in tags_val.split(",") if t]
+            column_name = _decode(column_name_raw)
+            if column_name and "column_name" not in metadata:
+                metadata["column_name"] = column_name
+            raw_key = key.decode() if isinstance(key, bytes | bytearray) else str(key)
+            doc_id = metadata.get("id")
+            if not doc_id:
+                doc_id = raw_key.rsplit(":", 1)[-1]
+                metadata["id"] = doc_id
+            doc = Document(page_content=text_val, metadata=metadata)
+            results.append((doc, score))
+
+        results.sort(key=lambda item: item[1])
+        return results[:k]
 
     def as_retriever(self, **kwargs: Any) -> VectorStoreRetriever:  # type: ignore[override]
         return VectorStoreRetriever(vectorstore=self, **kwargs)

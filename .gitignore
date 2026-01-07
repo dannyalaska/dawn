@@ -38,6 +38,9 @@ dmypy.json
 build/
 dist/
 *.egg-info/
+web/node_modules/
+web/.next/
+web/out/
 
 # Jupyter / notebooks
 .ipynb_checkpoints/

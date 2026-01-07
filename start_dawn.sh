@@ -9,6 +9,13 @@ cd "$SCRIPT_DIR"
 
 API_PID=""
 OLLAMA_PID=""
+UI_MODE="${DAWN_UI:-next}"
+NEXT_PORT="${DAWN_NEXT_PORT:-3000}"
+
+# Prefer Homebrew's Node 20 toolchain if it exists so the Next.js UI always boots.
+if [[ -z "${FORCE_NODE_PATH:-}" && -x "/opt/homebrew/opt/node@20/bin/node" ]]; then
+  export PATH="/opt/homebrew/opt/node@20/bin:$PATH"
+fi
 
 if [[ -f ".env" ]]; then
   echo "📦 Loading environment from .env"
@@ -151,4 +158,33 @@ for _ in {1..20}; do
   sleep 0.5
 done
 
-poetry run streamlit run app/streamlit_app/main.py --server.port 8501
+if [[ "${UI_MODE}" == "next" ]]; then
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    echo "⚠️  Node.js + npm not detected. Falling back to Streamlit UI. Set DAWN_UI=streamlit to silence this message."
+    UI_MODE="streamlit"
+  else
+    node_major="$(node -v | sed 's/^v//' | cut -d. -f1)"
+    if [[ "${node_major}" -lt 18 ]]; then
+      echo "⚠️  Node ${node_major} detected but Dawn's Next.js UI needs Node 18+. Falling back to Streamlit."
+      UI_MODE="streamlit"
+    fi
+  fi
+fi
+
+if [[ "${UI_MODE}" == "streamlit" ]]; then
+  echo "🎨 Launching legacy Streamlit cockpit on :8501 (set DAWN_UI=next for the new experience)."
+  poetry run streamlit run app/streamlit_app/main.py --server.port 8501
+elif [[ "${UI_MODE}" == "next" ]]; then
+  echo "🌅 Launching Dawn Next.js workspace on :${NEXT_PORT}"
+  (
+    cd web
+    if [[ ! -d node_modules ]]; then
+      echo "📦 Installing frontend dependencies..."
+      npm install
+    fi
+    PORT="${NEXT_PORT}" npm run dev -- --hostname 0.0.0.0 --port "${NEXT_PORT}"
+  )
+else
+  echo "⚠️  Unsupported DAWN_UI='${UI_MODE}'. Use 'next' or 'streamlit'."
+  exit 1
+fi

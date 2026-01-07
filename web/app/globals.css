@@ -1,0 +1,118 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --transition-base: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+body {
+  min-height: 100vh;
+  background-color: #050812;
+  color: #f1f5f9;
+  background-image: radial-gradient(circle at 10% 20%, rgba(248,113,113,0.2), transparent 45%),
+    radial-gradient(circle at 80% 0%, rgba(59,130,246,0.2), transparent 40%),
+    radial-gradient(circle at 50% 80%, rgba(248,250,107,0.12), transparent 55%);
+  background-attachment: fixed;
+  font-feature-settings: 'rlig' 1, 'calt' 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background-color: rgba(245, 158, 11, 0.4);
+  color: #f1f5f9;
+}
+
+/* Glass panel styles */
+.glass-panel {
+  background: rgba(15, 22, 39, 0.85);
+  border: 1px solid rgba(248, 250, 252, 0.08);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.glass-panel-sm {
+  background: rgba(15, 22, 39, 0.8);
+  border: 1px solid rgba(248, 250, 252, 0.05);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+/* Smooth scrollbar */
+.scroll-soft::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scroll-soft::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scroll-soft::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.3);
+  border-radius: 999px;
+  transition: background-color var(--transition-base);
+}
+
+.scroll-soft::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.5);
+}
+
+/* Fade border utility */
+.fade-border {
+  position: relative;
+}
+
+.fade-border::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(120deg, rgba(14, 165, 233, 0.3), rgba(245, 158, 11, 0.3));
+  -webkit-mask: linear-gradient(#000, #000) content-box, linear-gradient(#000, #000);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+/* Focus states */
+input:focus,
+textarea:focus,
+select:focus {
+  outline: none;
+  border-color: rgb(14, 165, 233);
+  box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.1);
+  transition: all var(--transition-base);
+}
+
+/* Button base */
+button {
+  transition: all var(--transition-base);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Text selection */
+h1, h2, h3, h4, h5, h6 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* Smooth transitions */
+* {
+  transition-property: background-color, border-color, color, fill, stroke, box-shadow;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 200ms;
+}
+
+*:disabled {
+  transition-duration: 0ms;
+}

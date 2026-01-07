@@ -1,7 +1,7 @@
 """add summary column to uploads
 
 Revision ID: a525995acbb9
-Revises: 70c9cc06c819
+Revises: 8f9dd22b22b2
 Create Date: 2025-10-07 18:10:00.000000
 
 """
@@ -14,7 +14,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "a525995acbb9"
-down_revision: Union[str, Sequence[str], None] = "70c9cc06c819"
+down_revision: Union[str, Sequence[str], None] = "8f9dd22b22b2"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
