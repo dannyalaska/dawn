@@ -6,7 +6,7 @@ import Onboarding from '@/components/ui/Onboarding';
 
 interface NotificationContextType {
   addToast: (type: ToastType, title: string, message?: string) => void;
-  showOnboarding: (isDemoMode?: boolean) => void;
+  showOnboarding: () => void;
   hideOnboarding: () => void;
 }
 
@@ -15,7 +15,6 @@ const NotificationContext = createContext<NotificationContextType | undefined>(u
 export function NotificationProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [showOnboardingModal, setShowOnboardingModal] = useState(false);
-  const [isDemoMode, setIsDemoMode] = useState(false);
 
   const addToast = useCallback((type: ToastType, title: string, message?: string) => {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -33,8 +32,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  const showOnboarding = useCallback((isDemoMode?: boolean) => {
-    setIsDemoMode(isDemoMode ?? false);
+  const showOnboarding = useCallback(() => {
     setShowOnboardingModal(true);
   }, []);
 
@@ -46,7 +44,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     <NotificationContext.Provider value={{ addToast, showOnboarding, hideOnboarding }}>
       {children}
       <ToastContainer toasts={toasts} onClose={removeToast} />
-      {showOnboardingModal && <Onboarding onClose={hideOnboarding} isDemoMode={isDemoMode} />}
+      {showOnboardingModal && <Onboarding onClose={hideOnboarding} />}
     </NotificationContext.Provider>
   );
 }

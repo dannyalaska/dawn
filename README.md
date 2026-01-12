@@ -183,12 +183,6 @@ Key features:
 
 Authentication is local-first: the app boots with a default account (`local@dawn.internal`). Use the **Account** panel to register new users, sign in, or manage tokens—each user keeps an isolated Redis/Postgres namespace.
 
-### Sample data
-- `demo_assets/support_copilot_demo.xlsx` — synthetic support tickets with agents + KPIs.
-- `demo_assets/support_transform.json` — example transform definition + sample rows.
-
-Feel free to delete these files if you do not want demo content in your fork. They never contain real customer or company data.
-
 ## Development commands
 
 ```bash

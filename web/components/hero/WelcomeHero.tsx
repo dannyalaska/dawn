@@ -7,8 +7,7 @@ import {
   ChatBubbleLeftRightIcon,
   CpuChipIcon,
   ChartBarIcon,
-  ArrowRightIcon,
-  PlayCircleIcon
+  ArrowRightIcon
 } from '@heroicons/react/24/outline';
 import FeatureCard from '@/components/ui/FeatureCard';
 import AnimatedCounter from '@/components/ui/AnimatedCounter';
@@ -101,15 +100,6 @@ export default function WelcomeHero({ onGetStarted, hasData }: WelcomeHeroProps)
               {hasData ? 'Continue Working' : 'Get Started'}
               <ArrowRightIcon className="h-5 w-5 transition-transform group-hover:translate-x-1" />
             </button>
-            <a
-              href="https://github.com/dannyalaska/dawn"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-6 py-4 text-lg font-medium text-slate-200 transition-all hover:border-white/40 hover:bg-white/10"
-            >
-              <PlayCircleIcon className="h-5 w-5" />
-              Watch Demo
-            </a>
           </div>
 
           {/* Stats */}

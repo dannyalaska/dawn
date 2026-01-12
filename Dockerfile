@@ -17,7 +17,6 @@ COPY docs docs
 COPY start_dawn.sh start_dawn.sh
 COPY alembic.ini alembic.ini
 COPY infra infra
-COPY demo_assets demo_assets
 
 RUN poetry install --without dev --no-ansi
 

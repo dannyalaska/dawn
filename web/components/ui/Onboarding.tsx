@@ -54,10 +54,9 @@ import { CloudArrowUpIcon, EyeIcon, ChatBubbleLeftRightIcon } from '@heroicons/r
 
 interface OnboardingProps {
   onClose?: () => void;
-  isDemoMode?: boolean;
 }
 
-export default function Onboarding({ onClose, isDemoMode }: OnboardingProps) {
+export default function Onboarding({ onClose }: OnboardingProps) {
   const [currentStep, setCurrentStep] = useState(0);
   const [dismissed, setDismissed] = useState(false);
 
@@ -163,12 +162,6 @@ export default function Onboarding({ onClose, isDemoMode }: OnboardingProps) {
           </button>
         </div>
 
-        {isDemoMode && (
-          <div className="text-center text-xs text-slate-500 border-t border-white/10 pt-4">
-            💡 Tip: Check sample workbooks in the{' '}
-            <span className="text-slate-400">Assets</span> folder to demo
-          </div>
-        )}
       </div>
     </div>
   );
