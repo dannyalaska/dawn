@@ -6,13 +6,9 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 
 ## Demo
 
-<video
-  controls
-  width="100%"
-  preload="metadata"
-  playsinline
-  src="https://raw.githubusercontent.com/dannyalaska/dawn/main/docs/DAWN_Demo_GitHub.mp4"
-></video>
+![Dawn demo](docs/dawn_demo.gif)
+
+[Watch the full demo video](docs/DAWN_Demo_GitHub.mp4)
 
 ---
 
