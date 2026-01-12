@@ -18,6 +18,8 @@ import ActionPlanPanel from '@/components/panels/ActionPlanPanel';
 import ChartsPanel from '@/components/panels/ChartsPanel';
 import WorkspaceOverviewPanel from '@/components/panels/WorkspaceOverviewPanel';
 import ActivityFeed, { type ActivityItem } from '@/components/ui/ActivityFeed';
+import { DemoModeOverlay } from '@/components/ui/DemoMode';
+import { useDemoMode } from '@/hooks/useDemoMode';
 import type { AgentRunSummary, FeedRecord, IndexExcelResponse, PreviewTable } from '@/lib/types';
 
 export default function DawnExperience() {
@@ -40,18 +42,52 @@ export default function DawnExperience() {
   const [expandedTileId, setExpandedTileId] = useState<string | null>(null);
   const [expandAll, setExpandAll] = useState(false);
   const [layoutMode, setLayoutMode] = useState<'wide' | 'tall'>('wide');
+  const demoMode = useDemoMode();
 
   useEffect(() => {
     const updateLayout = () => {
       const width = window.innerWidth || 0;
       const height = window.innerHeight || 0;
       const ratio = height ? width / height : 1;
-      setLayoutMode(ratio >= 1.15 ? 'wide' : 'tall');
+      const isWide = ratio >= 1.02 && width >= 900;
+      setLayoutMode(isWide ? 'wide' : 'tall');
     };
     updateLayout();
     window.addEventListener('resize', updateLayout);
     return () => window.removeEventListener('resize', updateLayout);
   }, []);
+
+  useEffect(() => {
+    const handleFocusTile = (event: Event) => {
+      const customEvent = event as CustomEvent;
+      const tileId = customEvent.detail?.tileId ?? null;
+      if (!tileId) {
+        setExpandedTileId(null);
+        return;
+      }
+      setExpandAll(false);
+      setExpandedTileId(tileId);
+    };
+
+    window.addEventListener('demo:focus-tile', handleFocusTile);
+    return () => window.removeEventListener('demo:focus-tile', handleFocusTile);
+  }, []);
+
+  useEffect(() => {
+    if (!expandedTileId || expandAll) return;
+    const tile = document.querySelector(`[data-demo-target='${expandedTileId}']`);
+    if (!(tile instanceof HTMLElement)) return;
+    const rafId = requestAnimationFrame(() => {
+      tile.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+    const timeoutId = window.setTimeout(() => {
+      tile.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 350);
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.clearTimeout(timeoutId);
+    };
+  }, [expandedTileId, expandAll]);
 
   // Activity logging
   const addActivity = useCallback((type: ActivityItem['type'], message: string, detail?: string) => {
@@ -64,6 +100,42 @@ export default function DawnExperience() {
     };
     setActivities((prev) => [newActivity, ...prev.slice(0, 49)]);
   }, []);
+
+  useEffect(() => {
+    const handleDemoUpload = (event: Event) => {
+      const customEvent = event as CustomEvent;
+      const fileName = customEvent.detail?.file?.name ?? 'demo workbook';
+      addActivity('upload', 'Demo upload started', fileName);
+    };
+    const handleDemoPreview = () => {
+      addActivity('profile', 'Preview generated', 'Columns + rows scanned');
+    };
+    const handleDemoIndex = () => {
+      addActivity('index', 'Indexing complete', 'Insights ready');
+    };
+    const handleDemoChat = (event: Event) => {
+      const customEvent = event as CustomEvent;
+      const question = customEvent.detail?.question ?? 'Demo question';
+      addActivity('chat', 'Asked a data question', question);
+    };
+    const handleDemoAgent = () => {
+      addActivity('agent', 'Agent swarm launched', 'Summarizing anomalies');
+    };
+
+    window.addEventListener('demo:upload-file', handleDemoUpload);
+    window.addEventListener('demo:preview-file', handleDemoPreview);
+    window.addEventListener('demo:index-file', handleDemoIndex);
+    window.addEventListener('demo:chat-question', handleDemoChat);
+    window.addEventListener('demo:agent-trigger', handleDemoAgent);
+
+    return () => {
+      window.removeEventListener('demo:upload-file', handleDemoUpload);
+      window.removeEventListener('demo:preview-file', handleDemoPreview);
+      window.removeEventListener('demo:index-file', handleDemoIndex);
+      window.removeEventListener('demo:chat-question', handleDemoChat);
+      window.removeEventListener('demo:agent-trigger', handleDemoAgent);
+    };
+  }, [addActivity]);
 
   // Simplified tile order for cleaner UI
   const tileOrder = useMemo(
@@ -233,6 +305,9 @@ export default function DawnExperience() {
 
   const toggleTile = (tileId: string) => {
     if (expandAll) return;
+    if (demoMode.isActive) {
+      demoMode.stopDemo();
+    }
     setExpandedTileId((prev) => (prev === tileId ? null : tileId));
   };
 
@@ -249,7 +324,7 @@ export default function DawnExperience() {
     const canCollapse = canToggle && expanded;
 
     return (
-      <div key={tileId} className={`group relative ${expanded ? 'col-span-full' : ''}`}>
+      <div key={tileId} className={`group relative ${expanded ? 'col-span-full' : ''}`} data-demo-target={tileId}>
         <div
           role={canExpand ? 'button' : undefined}
           tabIndex={canExpand ? 0 : -1}
@@ -280,11 +355,12 @@ export default function DawnExperience() {
                 event.stopPropagation();
                 toggleTile(tileId);
               }}
-              className="rounded-full border border-white/10 bg-black/40 px-3 py-1 text-[10px] uppercase tracking-[0.3em] text-amber-200 hover:border-white/30"
+              disabled={expandAll}
+              className="rounded-full border border-white/10 bg-black/40 px-3 py-1 text-[10px] uppercase tracking-[0.3em] text-amber-200 hover:border-white/30 disabled:opacity-50"
               aria-label={`${expanded ? 'Collapse' : 'Expand'} ${tile.title}`}
-              title={expanded ? 'Collapse' : 'Expand'}
+              title={expandAll ? 'Expanded' : expanded ? 'Collapse' : 'Expand'}
             >
-              {expanded ? 'Collapse' : 'Expand'}
+              {expandAll ? 'Expanded' : expanded ? 'Collapse' : 'Expand'}
             </button>
           </div>
             <div className={`mt-4 space-y-2 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
@@ -306,8 +382,17 @@ export default function DawnExperience() {
     );
   };
 
+  const workspaceLayout = layoutMode === 'wide' ? 'flex-row items-start' : 'flex-col';
+
   return (
     <div className="space-y-8">
+      <DemoModeOverlay
+        isVisible={demoMode.isActive}
+        currentStep={demoMode.currentStep}
+        totalSteps={demoMode.totalSteps}
+        step={demoMode.currentStepData}
+        onClose={demoMode.stopDemo}
+      />
       {/* Dashboard Header */}
       <DashboardHeader
         preview={preview}
@@ -316,22 +401,37 @@ export default function DawnExperience() {
       />
 
       {/* Main workspace */}
-      <div className="flex flex-col gap-8 lg:flex-row lg:items-start">
+      <div className={`flex gap-8 ${workspaceLayout}`}>
         <DawnSidebar />
         <div className="min-w-0 flex-1">
           {/* Activity feed sidebar */}
           <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
             <ActivityFeed activities={activities} maxItems={5} />
-            <button
-              type="button"
-              onClick={() => {
-                setExpandAll((prev) => !prev);
-                setExpandedTileId(null);
-              }}
-              className="rounded-full border border-white/10 bg-black/40 px-4 py-2 text-xs uppercase tracking-[0.3em] text-amber-200 hover:border-white/30"
-            >
-              {expandAll ? 'Collapse all' : 'Expand all'}
-            </button>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setExpandAll((prev) => !prev);
+                  setExpandedTileId(null);
+                }}
+                className="rounded-full border border-white/10 bg-black/40 px-4 py-2 text-xs uppercase tracking-[0.3em] text-amber-200 hover:border-white/30"
+              >
+                {expandAll ? 'Collapse all' : 'Expand all'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (demoMode.isActive) {
+                    demoMode.stopDemo();
+                    return;
+                  }
+                  void demoMode.startDemo();
+                }}
+                className="rounded-full bg-gradient-to-r from-amber-400 via-pink-500 to-sky-500 px-4 py-2 text-xs font-semibold text-slate-900 shadow-aurora hover:shadow-lg"
+              >
+                {demoMode.isActive ? 'Stop Demo' : 'Run Demo'}
+              </button>
+            </div>
           </div>
 
           {/* Expanded tile */}

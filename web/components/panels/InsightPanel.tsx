@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import type { IndexExcelResponse } from '@/lib/types';
 
 interface InsightPanelProps {
@@ -7,6 +8,17 @@ interface InsightPanelProps {
 }
 
 export default function InsightPanel({ summary }: InsightPanelProps) {
+  const [demoPulse, setDemoPulse] = useState(false);
+
+  useEffect(() => {
+    const handleDemoIndex = () => {
+      setDemoPulse(true);
+      window.setTimeout(() => setDemoPulse(false), 2400);
+    };
+    window.addEventListener('demo:index-file', handleDemoIndex);
+    return () => window.removeEventListener('demo:index-file', handleDemoIndex);
+  }, []);
+
   if (!summary) {
     return (
       <div className="rounded-3xl border border-dashed border-white/15 p-6 text-sm text-slate-400">
@@ -19,9 +31,15 @@ export default function InsightPanel({ summary }: InsightPanelProps) {
   const tags = summary.tags?.slice(0, 8) ?? [];
 
   return (
-    <div className="rounded-3xl border border-white/10 bg-white/5 p-6">
+    <div className={`rounded-3xl border border-white/10 bg-white/5 p-6 ${demoPulse ? 'shadow-[0_0_30px_rgba(251,191,36,0.25)]' : ''}`}>
       <p className="text-xs uppercase tracking-[0.4em] text-slate-400">Metrics &amp; tags</p>
       <h3 className="mt-1 text-lg font-semibold text-white">Dawn highlights</h3>
+      {demoPulse && (
+        <div className="mt-3 inline-flex items-center gap-2 rounded-full border border-amber-300/40 bg-amber-400/10 px-3 py-1 text-xs uppercase tracking-[0.3em] text-amber-200">
+          <span className="h-2 w-2 rounded-full bg-amber-300 animate-pulse" />
+          Insights generated
+        </div>
+      )}
       {tags.length > 0 && (
         <div className="mt-4 flex flex-wrap gap-2">
           {tags.map((tag) => (

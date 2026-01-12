@@ -25,7 +25,7 @@ export default function DawnSidebar() {
   };
 
   return (
-    <aside className="w-full max-w-sm space-y-4 lg:sticky lg:top-8">
+    <aside className="w-full max-w-sm space-y-4 lg:sticky lg:top-8" data-demo-target="dawn-sidebar">
       {/* Logo & Branding */}
       <Link
         href="/"

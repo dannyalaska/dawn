@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { SparklesIcon, CheckCircleIcon, ExclamationTriangleIcon } from '@heroicons/react/24/outline';
 import useDawnData from '@/hooks/useDawnData';
 import AgentRunLog from '@/components/panels/AgentRunLog';
@@ -22,6 +22,12 @@ export default function AgentPanel({ activeFeedId, onRun }: AgentPanelProps) {
   const [result, setResult] = useState<AgentRunSummary | null>(null);
   const [error, setError] = useState('');
   const [lastRunFeed, setLastRunFeed] = useState<string | null>(null);
+  const [demoRunRequested, setDemoRunRequested] = useState(false);
+  const [demoRunIdentifier, setDemoRunIdentifier] = useState<string | null>(null);
+  const [demoSelectActive, setDemoSelectActive] = useState(false);
+  const demoSelectTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [demoRunActive, setDemoRunActive] = useState(false);
+  const demoRunTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const executeRun = useCallback(
     async (feedId?: string, auto = false) => {
@@ -70,6 +76,61 @@ export default function AgentPanel({ activeFeedId, onRun }: AgentPanelProps) {
   }, [activeFeedId, lastRunFeed, pending, executeRun]);
 
   const feedList = (feeds.data ?? []) as FeedRecord[];
+  const demoOptions = feedList.length
+    ? feedList.slice(0, 4).map((feed) => feed.name)
+    : ['Support Tickets', 'Revenue Forecast', 'Ops Incidents', 'Customer Health'];
+
+  useEffect(() => {
+    const handleDemoRun = (event: Event) => {
+      const customEvent = event as CustomEvent;
+      const identifier = customEvent.detail?.identifier ?? null;
+      setDemoRunIdentifier(identifier);
+      setDemoRunRequested(true);
+      setDemoSelectActive(true);
+      setDemoRunActive(true);
+      if (demoSelectTimerRef.current) {
+        clearTimeout(demoSelectTimerRef.current);
+      }
+      demoSelectTimerRef.current = window.setTimeout(() => {
+        setDemoSelectActive(false);
+      }, 2400);
+      if (demoRunTimerRef.current) {
+        clearTimeout(demoRunTimerRef.current);
+      }
+      demoRunTimerRef.current = window.setTimeout(() => {
+        setDemoRunActive(false);
+      }, 3200);
+    };
+
+    window.addEventListener('demo:agent-trigger', handleDemoRun);
+    return () => {
+      window.removeEventListener('demo:agent-trigger', handleDemoRun);
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (demoSelectTimerRef.current) {
+        clearTimeout(demoSelectTimerRef.current);
+      }
+      if (demoRunTimerRef.current) {
+        clearTimeout(demoRunTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!demoRunRequested || pending) return;
+    const directMatch = demoRunIdentifier
+      ? feedList.find((feed) => feed.identifier === demoRunIdentifier)
+      : null;
+    const fallbackFeed = feedList[feedList.length - 1];
+    const targetFeed = directMatch ?? fallbackFeed;
+    if (!targetFeed) return;
+    setSelected(targetFeed.identifier);
+    setDemoRunRequested(false);
+    void executeRun(targetFeed.identifier, true);
+  }, [demoRunIdentifier, demoRunRequested, executeRun, feedList, pending]);
 
   return (
     <div className="glass-panel rounded-3xl p-6 space-y-4">
@@ -87,7 +148,9 @@ export default function AgentPanel({ activeFeedId, onRun }: AgentPanelProps) {
         <label className="block text-sm text-slate-200">
           <span className="text-xs uppercase tracking-[0.3em] text-slate-500 mb-2 block">Select Feed</span>
           <select
-            className="w-full rounded-2xl border border-white/10 bg-black/40 px-3 py-2 text-sm focus:border-sky-400 focus:ring-2 focus:ring-sky-400/20"
+            className={`w-full rounded-2xl border border-white/10 bg-black/40 px-3 py-2 text-sm focus:border-sky-400 focus:ring-2 focus:ring-sky-400/20 ${
+              demoSelectActive ? 'ring-2 ring-amber-400/40' : ''
+            }`}
             value={selected}
             onChange={(event) => setSelected(event.target.value)}
           >
@@ -98,6 +161,25 @@ export default function AgentPanel({ activeFeedId, onRun }: AgentPanelProps) {
               </option>
             ))}
           </select>
+          {demoSelectActive && (
+            <div className="mt-3 rounded-2xl border border-amber-300/30 bg-amber-400/10 p-3 text-xs text-amber-100">
+              <p className="uppercase tracking-[0.3em] text-amber-200">Auto-selecting feed</p>
+              <div className="mt-2 space-y-1">
+                {demoOptions.map((name) => (
+                  <div
+                    key={name}
+                    className={`rounded-xl px-3 py-2 ${
+                      name.toLowerCase().includes('support')
+                        ? 'bg-amber-400/20 text-amber-50'
+                        : 'bg-black/30 text-amber-100/80'
+                    }`}
+                  >
+                    {name}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </label>
 
         <label className="block text-sm text-slate-200">
@@ -109,6 +191,20 @@ export default function AgentPanel({ activeFeedId, onRun }: AgentPanelProps) {
             placeholder="What insights should the agents find?"
           />
         </label>
+
+        {demoRunActive && (
+          <div className="rounded-2xl border border-pink-400/30 bg-pink-500/10 p-3 text-xs text-pink-100">
+            <div className="flex items-center gap-2 uppercase tracking-[0.3em] text-pink-200">
+              <span className="h-2 w-2 rounded-full bg-pink-300 animate-pulse" />
+              Agents running
+            </div>
+            <div className="mt-2 space-y-1 text-[11px] text-pink-100/80">
+              <p>Scanning anomalies and spikes</p>
+              <p>Cross-checking metrics and trends</p>
+              <p>Summarizing executive takeaways</p>
+            </div>
+          </div>
+        )}
 
         <button
           type="button"

@@ -1,6 +1,6 @@
 'use client';
 
-import { FormEvent, useState, useRef, useEffect } from 'react';
+import { FormEvent, useState, useRef, useEffect, useCallback } from 'react';
 import { PaperAirplaneIcon, CheckCircleIcon } from '@heroicons/react/24/outline';
 import { chatRag } from '@/lib/api';
 import { useDawnSession } from '@/context/dawn-session';
@@ -13,11 +13,17 @@ interface ContextChatPanelProps {
 export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
   const { token, apiBase } = useDawnSession();
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<RagMessage[]>([]);
+  const demoAnswerRef = useRef<string | null>(null);
+  const typingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [messages, setMessages] = useState<RagMessage[]>([]);
   const [input, setInput] = useState('What changed in the latest upload?');
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
   const [sources, setSources] = useState<any[]>([]);
+  const [pendingDemoQuestion, setPendingDemoQuestion] = useState<string | null>(null);
+  const [pendingDemoAnswer, setPendingDemoAnswer] = useState<string | null>(null);
+  const [demoTyping, setDemoTyping] = useState(false);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -27,13 +33,26 @@ export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
     scrollToBottom();
   }, [messages]);
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!input.trim() || disabled) return;
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      if (typingTimerRef.current) {
+        clearTimeout(typingTimerRef.current);
+      }
+    };
+  }, []);
+
+  const sendQuestion = useCallback(async (question: string) => {
+    const trimmed = question.trim();
+    if (!trimmed || disabled || pending) return;
     setPending(true);
     setError('');
+    const nextMessages = [...messagesRef.current, { role: 'user', content: trimmed }];
+    setMessages(nextMessages);
     try {
-      const nextMessages = [...messages, { role: 'user', content: input.trim() }];
       const response = await chatRag(nextMessages, { token, apiBase });
       let merged: RagMessage[] = [];
       if (response.messages && response.messages.length > 0) {
@@ -47,11 +66,78 @@ export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
       setSources(response.sources || []);
       setInput('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Chat failed');
+      const fallback = demoAnswerRef.current;
+      if (fallback) {
+        setMessages([...nextMessages, { role: 'assistant', content: fallback }]);
+        setSources([]);
+        setInput('');
+        setError('');
+      } else {
+        setError(err instanceof Error ? err.message : 'Chat failed');
+      }
     } finally {
       setPending(false);
+      demoAnswerRef.current = null;
     }
+  }, [apiBase, disabled, pending, token]);
+
+  const startDemoTyping = useCallback(
+    (question: string, demoAnswer?: string | null) => {
+      const trimmed = question.trim();
+      if (!trimmed) return;
+      if (typingTimerRef.current) {
+        clearTimeout(typingTimerRef.current);
+      }
+      demoAnswerRef.current = demoAnswer ?? null;
+      setDemoTyping(true);
+      setInput('');
+      let index = 0;
+      const step = () => {
+        index += 1;
+        setInput(trimmed.slice(0, index));
+        if (index < trimmed.length) {
+          typingTimerRef.current = setTimeout(step, 35);
+        } else {
+          setDemoTyping(false);
+          void sendQuestion(trimmed);
+        }
+      };
+      typingTimerRef.current = setTimeout(step, 60);
+    },
+    [sendQuestion]
+  );
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void sendQuestion(input);
   }
+
+  useEffect(() => {
+    const handleDemoQuestion = (event: Event) => {
+      const customEvent = event as CustomEvent;
+      const question = customEvent.detail?.question ?? '';
+      const demoAnswer = customEvent.detail?.demoAnswer ?? null;
+      if (!question.trim()) return;
+      if (disabled || pending || demoTyping) {
+        setPendingDemoQuestion(question);
+        setPendingDemoAnswer(demoAnswer);
+        return;
+      }
+      startDemoTyping(question, demoAnswer);
+    };
+
+    window.addEventListener('demo:chat-question', handleDemoQuestion);
+    return () => {
+      window.removeEventListener('demo:chat-question', handleDemoQuestion);
+    };
+  }, [demoTyping, disabled, pending, startDemoTyping]);
+
+  useEffect(() => {
+    if (!pendingDemoQuestion || disabled || pending || demoTyping) return;
+    startDemoTyping(pendingDemoQuestion, pendingDemoAnswer);
+    setPendingDemoQuestion(null);
+    setPendingDemoAnswer(null);
+  }, [demoTyping, disabled, pending, pendingDemoAnswer, pendingDemoQuestion, startDemoTyping]);
 
   return (
     <div className="glass-panel rounded-3xl p-6 flex flex-col h-full">
@@ -120,17 +206,23 @@ export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
 
       {/* Input form */}
       <form onSubmit={handleSubmit} className="space-y-3">
+        {demoTyping && (
+          <div className="flex items-center gap-2 text-xs uppercase tracking-[0.3em] text-amber-200">
+            <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+            Auto-typing demo question
+          </div>
+        )}
         <textarea
           className="w-full rounded-2xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-white focus:border-sky-400 focus:ring-2 focus:ring-sky-400/20 disabled:opacity-50 resize-none"
           rows={3}
           value={input}
-          disabled={pending || disabled}
+          disabled={pending || disabled || demoTyping}
           onChange={(event) => setInput(event.target.value)}
           placeholder="Ask about your data..."
         />
         <button
           type="submit"
-          disabled={pending || disabled || !input.trim()}
+          disabled={pending || disabled || demoTyping || !input.trim()}
           className="w-full inline-flex items-center justify-center gap-2 rounded-full bg-gradient-to-r from-amber-400 via-pink-500 to-sky-500 px-4 py-2 text-sm font-semibold text-slate-900 shadow-aurora hover:shadow-lg disabled:opacity-50 transition-all"
         >
           <PaperAirplaneIcon className="h-4 w-4" />

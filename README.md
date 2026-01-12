@@ -4,6 +4,16 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 
 ---
 
+## Demo
+
+<video controls width="100%">
+  <source src="docs/DAWN%20Demo%201.mp4" type="video/mp4">
+</video>
+
+[Watch the demo video](docs/DAWN%20Demo%201.mp4)
+
+---
+
 ## What makes Dawn unique
 
 ### 1. Agentic ingestion

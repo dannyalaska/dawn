@@ -13,6 +13,7 @@ from sqlalchemy import text
 from app.api.agents import router as agents_router
 from app.api.auth import router as auth_router
 from app.api.backends import router as backends_router
+from app.api.demo import router as demo_router
 from app.api.excel import router as excel_router
 from app.api.feeds import router as feeds_router
 from app.api.jobs import router as jobs_router
@@ -154,6 +155,7 @@ def health_llm():
 app.include_router(excel_router)
 app.include_router(auth_router)
 app.include_router(backends_router)
+app.include_router(demo_router)
 app.include_router(feeds_router)
 app.include_router(rag_router)
 app.include_router(transforms_router)
