@@ -1,22 +1,67 @@
 'use client';
 
 import { FormEvent, useState, useRef, useEffect, useCallback } from 'react';
-import { PaperAirplaneIcon, CheckCircleIcon } from '@heroicons/react/24/outline';
-import { chatRag } from '@/lib/api';
+import { PaperAirplaneIcon, CheckCircleIcon, CpuChipIcon } from '@heroicons/react/24/outline';
+import { addContextNote, chatRag, fetchMemory, generateSql, updateMemory } from '@/lib/api';
 import { useDawnSession } from '@/context/dawn-session';
 import type { RagMessage } from '@/lib/types';
+import clsx from 'clsx';
 
 interface ContextChatPanelProps {
   disabled?: boolean;
+  source?: string | null;
+  activeFeedId?: string | null;
+  memory?: { sha16: string; sheet: string } | null;
 }
 
-export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
+type DisplayMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  kind?: 'chat' | 'sql' | 'note';
+  title?: string;
+};
+
+const buildMessageId = () => `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+const extractContextHint = (text: string) => {
+  const columnMatch = text.match(
+    /(column|field|metric)\s+([a-z0-9_ \-]+?)\s+(means|is|represents|refers to|indicates)\s+(.+)/i
+  );
+  if (columnMatch) {
+    const column = columnMatch[2]?.trim();
+    const definition = columnMatch[4]?.trim();
+    if (column && definition) {
+      return {
+        note: `Column ${column} ${columnMatch[3]} ${definition}`,
+        relationships: { [column]: definition }
+      };
+    }
+  }
+
+  const valueMatch = text.match(
+    /(value|category|label)\s+["']?([^"']+)["']?\s+(means|is|represents|refers to|indicates)\s+(.+)/i
+  );
+  if (valueMatch) {
+    const value = valueMatch[2]?.trim();
+    const definition = valueMatch[4]?.trim();
+    if (value && definition) {
+      return {
+        note: `Value ${value} ${valueMatch[3]} ${definition}`
+      };
+    }
+  }
+
+  return null;
+};
+
+export default function ContextChatPanel({ disabled, source, activeFeedId, memory }: ContextChatPanelProps) {
   const { token, apiBase } = useDawnSession();
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const messagesRef = useRef<RagMessage[]>([]);
+  const ragMessagesRef = useRef<RagMessage[]>([]);
   const demoAnswerRef = useRef<string | null>(null);
   const typingTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const [messages, setMessages] = useState<RagMessage[]>([]);
+  const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [input, setInput] = useState('What changed in the latest upload?');
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
@@ -33,9 +78,36 @@ export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
     scrollToBottom();
   }, [messages]);
 
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
+  const persistContextHint = useCallback(
+    async (question: string) => {
+      if (!source || !memory) return;
+      const hint = extractContextHint(question);
+      if (!hint?.note) return;
+      try {
+        await addContextNote({ source, text: hint.note }, { token, apiBase });
+        const existing = await fetchMemory(memory.sha16, memory.sheet, { token, apiBase });
+        const nextRelationships = hint.relationships
+          ? { ...(existing.relationships ?? {}), ...hint.relationships }
+          : existing.relationships ?? {};
+        const nextNotes = [...(existing.notes ?? [])];
+        if (!nextNotes.includes(hint.note)) {
+          nextNotes.push(hint.note);
+        }
+        await updateMemory(
+          {
+            sha16: memory.sha16,
+            sheet: memory.sheet,
+            relationships: nextRelationships,
+            notes: nextNotes
+          },
+          { token, apiBase }
+        );
+      } catch (err) {
+        console.warn('Failed to persist context hint', err);
+      }
+    },
+    [apiBase, memory, source, token]
+  );
 
   useEffect(() => {
     return () => {
@@ -50,25 +122,100 @@ export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
     if (!trimmed || disabled || pending) return;
     setPending(true);
     setError('');
-    const nextMessages = [...messagesRef.current, { role: 'user', content: trimmed }];
-    setMessages(nextMessages);
+    const userMessage: RagMessage = { role: 'user', content: trimmed };
+    ragMessagesRef.current = [...ragMessagesRef.current, userMessage];
+    setMessages((prev) => [
+      ...prev,
+      { id: buildMessageId(), role: 'user', content: trimmed, kind: 'chat' }
+    ]);
+
+    void persistContextHint(trimmed);
+
+    let sqlMessageId: string | null = null;
+    if (activeFeedId) {
+      sqlMessageId = buildMessageId();
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: sqlMessageId,
+          role: 'assistant',
+          content: 'Generating SQL from your question…',
+          kind: 'sql',
+          title: 'NL → SQL agent'
+        }
+      ]);
+      void generateSql(
+        {
+          question: trimmed,
+          feed_identifiers: [activeFeedId],
+          dialect: 'postgres',
+          allow_writes: false
+        },
+        { token, apiBase }
+      )
+        .then((result) => {
+          const sqlBlock = result.sql ? `\n${result.sql.trim()}` : 'No SQL generated.';
+          const warnings = result.validation?.warnings?.length
+            ? `\nWarnings: ${result.validation.warnings.join(' · ')}`
+            : '';
+          const errors = result.validation?.errors?.length
+            ? `\nErrors: ${result.validation.errors.join(' · ')}`
+            : '';
+          const validationLabel = result.validation?.ok ? 'Validated' : 'Needs review';
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === sqlMessageId
+                ? {
+                    ...msg,
+                    title: `NL → SQL agent · ${validationLabel}`,
+                    content: `${sqlBlock}${warnings}${errors}`.trim()
+                  }
+                : msg
+            )
+          );
+        })
+        .catch((err) => {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === sqlMessageId
+                ? {
+                    ...msg,
+                    title: 'NL → SQL agent · unavailable',
+                    content: err instanceof Error ? err.message : 'Unable to generate SQL.'
+                  }
+                : msg
+            )
+          );
+        });
+    }
     try {
-      const response = await chatRag(nextMessages, { token, apiBase });
+      const response = await chatRag(ragMessagesRef.current, { token, apiBase });
       let merged: RagMessage[] = [];
       if (response.messages && response.messages.length > 0) {
         merged = response.messages as RagMessage[];
       } else if (response.answer) {
-        merged = [...nextMessages, { role: 'assistant', content: response.answer }];
+        merged = [...ragMessagesRef.current, { role: 'assistant', content: response.answer }];
       } else {
-        merged = nextMessages;
+        merged = ragMessagesRef.current;
       }
-      setMessages(merged);
+      ragMessagesRef.current = merged;
+      const assistantMsg = merged[merged.length - 1];
+      if (assistantMsg?.role === 'assistant') {
+        setMessages((prev) => [
+          ...prev,
+          { id: buildMessageId(), role: 'assistant', content: assistantMsg.content, kind: 'chat' }
+        ]);
+      }
       setSources(response.sources || []);
       setInput('');
     } catch (err) {
       const fallback = demoAnswerRef.current;
       if (fallback) {
-        setMessages([...nextMessages, { role: 'assistant', content: fallback }]);
+        ragMessagesRef.current = [...ragMessagesRef.current, { role: 'assistant', content: fallback }];
+        setMessages((prev) => [
+          ...prev,
+          { id: buildMessageId(), role: 'assistant', content: fallback, kind: 'chat' }
+        ]);
         setSources([]);
         setInput('');
         setError('');
@@ -79,7 +226,7 @@ export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
       setPending(false);
       demoAnswerRef.current = null;
     }
-  }, [apiBase, disabled, pending, token]);
+  }, [activeFeedId, apiBase, disabled, pending, persistContextHint, token]);
 
   const startDemoTyping = useCallback(
     (question: string, demoAnswer?: string | null) => {
@@ -121,8 +268,8 @@ export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
       if (disabled || pending || demoTyping) {
         setPendingDemoQuestion(question);
         setPendingDemoAnswer(demoAnswer);
-        return;
-      }
+      return;
+    }
       startDemoTyping(question, demoAnswer);
     };
 
@@ -147,38 +294,56 @@ export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
       </div>
 
       {/* Messages area */}
-      {messages.length > 0 && (
-        <div className="flex-1 overflow-y-auto scroll-soft mb-4 space-y-3 pr-2">
-          {messages.map((msg, idx) => (
+      <div className="flex-1 h-64 sm:h-72 overflow-y-auto scroll-soft mb-4 space-y-3 pr-2">
+        {messages.length === 0 && (
+          <div className="flex h-full items-center justify-center text-sm text-slate-500">
+            Index a workbook to start asking questions.
+          </div>
+        )}
+        {messages.map((msg) => {
+          const isUser = msg.role === 'user';
+          const isSql = msg.kind === 'sql';
+          return (
             <div
-              key={idx}
-              className={`animate-slide-up flex gap-3 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+              key={msg.id}
+              className={`animate-slide-up flex gap-3 ${isUser ? 'justify-end' : 'justify-start'}`}
             >
               <div
-                className={`max-w-xs px-4 py-2 rounded-2xl text-sm leading-relaxed ${
-                  msg.role === 'user'
-                    ? 'bg-amber-500/20 border border-amber-500/30 text-slate-100'
-                    : 'bg-sky-500/10 border border-sky-500/20 text-slate-100'
-                }`}
+                className={clsx(
+                  'max-w-xs rounded-2xl border px-4 py-2 text-sm leading-relaxed sm:max-w-sm',
+                  isUser && 'bg-amber-500/20 border-amber-500/30 text-slate-100',
+                  !isUser && !isSql && 'bg-sky-500/10 border-sky-500/20 text-slate-100',
+                  isSql && 'bg-emerald-500/10 border-emerald-500/20 text-emerald-100'
+                )}
               >
-                {msg.content}
+                {msg.title && (
+                  <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.3em] text-emerald-200">
+                    <CpuChipIcon className="h-3 w-3" />
+                    {msg.title}
+                  </div>
+                )}
+                {isSql ? (
+                  <pre className="whitespace-pre-wrap break-words text-xs text-emerald-100">{msg.content}</pre>
+                ) : (
+                  msg.content
+                )}
               </div>
             </div>
-          ))}
-          {pending && (
-            <div className="flex justify-start">
-              <div className="bg-slate-700/30 border border-slate-600/30 px-4 py-2 rounded-2xl">
-                <div className="flex gap-1">
-                  <div className="w-2 h-2 rounded-full bg-slate-400 animate-pulse" />
-                  <div className="w-2 h-2 rounded-full bg-slate-400 animate-pulse" style={{ animationDelay: '0.1s' }} />
-                  <div className="w-2 h-2 rounded-full bg-slate-400 animate-pulse" style={{ animationDelay: '0.2s' }} />
-                </div>
+          );
+        })}
+        {pending && (
+          <div className="flex justify-start">
+            <div className="bg-slate-700/30 border border-slate-600/30 px-4 py-2 rounded-2xl">
+              <div className="flex gap-1">
+                <div className="w-2 h-2 rounded-full bg-slate-400 animate-pulse" />
+                <div className="w-2 h-2 rounded-full bg-slate-400 animate-pulse" style={{ animationDelay: '0.1s' }} />
+                <div className="w-2 h-2 rounded-full bg-slate-400 animate-pulse" style={{ animationDelay: '0.2s' }} />
               </div>
             </div>
-          )}
-          <div ref={messagesEndRef} />
-        </div>
-      )}
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
 
       {/* Sources display */}
       {sources.length > 0 && (
@@ -229,13 +394,6 @@ export default function ContextChatPanel({ disabled }: ContextChatPanelProps) {
           {pending ? 'Thinking…' : 'Send'}
         </button>
       </form>
-
-      {/* Empty state */}
-      {messages.length === 0 && !disabled && (
-        <div className="flex flex-col items-center justify-center flex-1 text-center">
-          <p className="text-slate-500 text-sm">Index a workbook to start asking questions.</p>
-        </div>
-      )}
 
       {disabled && (
         <p className="mt-2 text-xs text-slate-500 text-center">Index a workbook to unlock contextual chat.</p>

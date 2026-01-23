@@ -38,6 +38,13 @@ from app.core.transforms import TransformDefinition
 RECENT_KEY = "dawn:nl2sql:recent_questions"
 
 
+class BackendConn(TypedDict):
+    id: int
+    name: str
+    kind: str
+    config: dict[str, Any]
+
+
 def _recent_key(user_id: str) -> str:
     return f"{RECENT_KEY}:{user_id}"
 
@@ -183,7 +190,7 @@ def _backend_table_manifests(user_id: int) -> list[TableManifest]:
             .scalars()
             .all()
         )
-        connections = [
+        connections: list[BackendConn] = [
             {
                 "id": conn.id,
                 "name": conn.name,
@@ -309,7 +316,7 @@ def _prompt(
         {recent_text}
 
         Retrieved documentation:
-        {rag_context or '(none)'}
+        {rag_context or "(none)"}
 
         Question: {question}
         """

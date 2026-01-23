@@ -1,6 +1,6 @@
-# Dawn — Local AI Data Copilot
+# Dawn — Local AI Data Copilot (Dev Showcase)
 
-Dawn ingests Excel workbooks, understands their schema, proposes an analysis plan, runs deterministic metrics, and then layers semantic search + LLM reasoning on top. Everything is local: profile with pandas, store knowledge in Redis/Postgres, and choose your own LLM (Ollama, LM Studio, OpenAI).
+Dawn ingests Excel workbooks, understands their schema, proposes an analysis plan, runs deterministic metrics, and then layers semantic search + LLM reasoning on top. Everything is local: profile with pandas, store knowledge in Redis/Postgres, and choose your own LLM (Ollama, LM Studio, OpenAI). This repo is intentionally **dev-only** for showcase and interview walkthroughs.
 
 ---
 
@@ -17,7 +17,7 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 ### 1. Agentic ingestion
 1. Upload a workbook (sheet picker included).
 2. Pandas profiles every column and builds categorical counts, numeric stats, and time-based aggregates.
-3. A local LLM reviews that profile and recommends an analysis plan (e.g., “count tickets by Assigned_To”, “average Resolution_Time_Hours by Assigned_To”).
+3. The planner agent converts that profile into a reasoned analysis plan (e.g., “count tickets by Assigned_To”, “average Resolution_Time_Hours by Assigned_To”), adding `rationale` and `intent`.
 4. Dawn executes the plan, stores precise metrics in Postgres/Redis, and generates semantic context notes for citations.
 
 ### 2. Editable memory layer
@@ -34,6 +34,7 @@ Dawn ingests Excel workbooks, understands their schema, proposes an analysis pla
 - A LangGraph-powered swarm coordinates planning, metric execution, memory curation, and QA.
 - Trigger the workflow via `POST /agents/analyze` to refresh context, surface insights, and answer follow-ups cooperatively.
 - Every agent logs its actions so you can audit the plan, execution steps, and guardrail warnings in one payload.
+- See `docs/AGENT_ARCHITECTURE.md` for a dedicated agent architecture diagram and reasoning fields.
 
 ---
 
@@ -154,6 +155,10 @@ poetry install --no-interaction --no-ansi
 cp .env.example .env
 # edit Postgres, Redis, and LLM settings to match your machine
 ```
+
+Key settings for the dev showcase:
+- `REQUIRE_REDIS=true` and `REQUIRE_POSTGRES=true` enforce live connections at startup.
+- `MAX_UPLOAD_BYTES` and `MAX_REMOTE_BYTES` cap upload and remote ingestion sizes.
 
 ### Run
 ```bash

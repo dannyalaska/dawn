@@ -13,7 +13,9 @@ import type {
   ServiceHealth,
   RagChatResponse,
   RagMessage,
-  JobRecord
+  JobRecord,
+  LMStudioModelsResponse,
+  NL2SQLResponse
 } from '@/lib/types';
 
 export class DawnHttpError extends Error {
@@ -114,6 +116,23 @@ export async function fetchMemory(sha16: string, sheet: string, opts?: DawnReque
   return dawnRequest<MemoryPayload>(`/rag/memory?sha16=${encodeURIComponent(sha16)}&sheet=${encodeURIComponent(sheet)}`, opts);
 }
 
+export async function updateMemory(
+  payload: {
+    sha16: string;
+    sheet: string;
+    relationships?: Record<string, string>;
+    analysis_plan?: Array<Record<string, unknown>>;
+    notes?: string[];
+  },
+  opts?: DawnRequestOptions
+) {
+  return dawnRequest<MemoryPayload>('/rag/memory', {
+    method: 'PUT',
+    json: payload,
+    ...(opts || {})
+  });
+}
+
 export async function fetchRunnerMeta(opts?: DawnRequestOptions) {
   return dawnRequest<RunnerMeta>('/jobs/runner/meta', opts);
 }
@@ -193,6 +212,23 @@ export async function addContextNote(payload: { source: string; text: string }, 
   });
 }
 
+export async function generateSql(
+  payload: {
+    question: string;
+    feed_identifiers?: string[];
+    allow_writes?: boolean;
+    dialect?: string;
+    explain?: boolean;
+  },
+  opts?: DawnRequestOptions
+) {
+  return dawnRequest<NL2SQLResponse>('/nl/sql', {
+    method: 'POST',
+    json: payload,
+    ...(opts || {})
+  });
+}
+
 export async function updateContextNote(chunkId: string, text: string, opts?: DawnRequestOptions) {
   return dawnRequest(`/rag/context/${encodeURIComponent(chunkId)}`, {
     method: 'PUT',
@@ -231,6 +267,54 @@ export async function ingestFeed(form: FormData, opts?: DawnRequestOptions) {
   return dawnRequest('/feeds/ingest', {
     method: 'POST',
     formData: form,
+    ...(opts || {})
+  });
+}
+
+export async function fetchLmStudioModels(
+  opts?: DawnRequestOptions & { baseUrl?: string }
+) {
+  const { baseUrl, ...requestOpts } = opts || {};
+  const query = baseUrl ? `?base_url=${encodeURIComponent(baseUrl)}` : '';
+  return dawnRequest<LMStudioModelsResponse>(`/lmstudio/models${query}`, requestOpts);
+}
+
+export async function loadLmStudioModel(
+  payload: {
+    model_key: string;
+    base_url?: string;
+    identifier?: string;
+    context_length?: number;
+    gpu?: string;
+    ttl_seconds?: number;
+  },
+  opts?: DawnRequestOptions
+) {
+  return dawnRequest('/lmstudio/load', {
+    method: 'POST',
+    json: payload,
+    ...(opts || {})
+  });
+}
+
+export async function unloadLmStudioModel(
+  payload: { model_key?: string; base_url?: string; unload_all?: boolean },
+  opts?: DawnRequestOptions
+) {
+  return dawnRequest('/lmstudio/unload', {
+    method: 'POST',
+    json: payload,
+    ...(opts || {})
+  });
+}
+
+export async function useLmStudioModel(
+  payload: { model: string; base_url?: string; provider?: string },
+  opts?: DawnRequestOptions
+) {
+  return dawnRequest('/lmstudio/use', {
+    method: 'POST',
+    json: payload,
     ...(opts || {})
   });
 }

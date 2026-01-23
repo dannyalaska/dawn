@@ -10,6 +10,7 @@ import type { IndexExcelResponse, PreviewTable } from '@/lib/types';
 interface UploadPanelProps {
   onPreviewed?: (preview: PreviewTable | null) => void;
   onProfiled?: (sourceKey: string | null, profile: IndexExcelResponse | null) => void;
+  onFileSelected?: (file: File | null) => void;
 }
 
 const DEMO_ROWS = [
@@ -201,7 +202,7 @@ function buildDemoProfile(sourceName: string, chunkSize: number, overlap: number
   };
 }
 
-export default function UploadPanel({ onPreviewed, onProfiled }: UploadPanelProps) {
+export default function UploadPanel({ onPreviewed, onProfiled, onFileSelected }: UploadPanelProps) {
   const { token, apiBase } = useDawnSession();
   const { mutate } = useSWRConfig();
   const [file, setFile] = useState<File | null>(null);
@@ -254,6 +255,7 @@ export default function UploadPanel({ onPreviewed, onProfiled }: UploadPanelProp
     }
     setDemoUploadProgress(null);
     setFile(nextFile);
+    onFileSelected?.(nextFile);
     setIsDemoFile(Boolean(nextFile?.name?.startsWith('demo-support-tickets')));
     setSheet('');
     setSheetOptions([]);

@@ -10,6 +10,7 @@ from typing import Any, Literal
 import pandas as pd
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi import Query as FQuery
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 from redis.exceptions import ResponseError
 from sqlalchemy import select
@@ -18,6 +19,7 @@ from app.core.auth import CurrentUser
 from app.core.chat_graph import run_chat
 from app.core.db import session_scope
 from app.core.excel.summary import summarize_dataframe
+from app.core.limits import SizeLimitError, read_upload_bytes
 from app.core.models import Upload
 from app.core.rag import (
     Chunk,
@@ -46,12 +48,34 @@ async def index_excel(
     *,
     current_user: CurrentUser,
 ) -> dict:
+    try:
+        data = await read_upload_bytes(file, label="RAG Excel index")
+    except SizeLimitError as exc:
+        raise HTTPException(413, str(exc)) from exc
     name = file.filename or "upload.xlsx"
-    data = await file.read()
+    return await run_in_threadpool(
+        _index_excel_sync,
+        data,
+        name,
+        sheet,
+        chunk_max_chars,
+        chunk_overlap,
+        current_user.id,
+    )
+
+
+def _index_excel_sync(
+    data: bytes,
+    name: str,
+    sheet: str | None,
+    chunk_max_chars: int,
+    chunk_overlap: int,
+    user_id: int,
+) -> dict[str, Any]:
     try:
         xl = pd.ExcelFile(BytesIO(data))
-    except Exception as e:
-        raise HTTPException(400, f"Failed to read Excel: {e}") from e
+    except Exception as exc:
+        raise HTTPException(400, f"Failed to read Excel: {exc}") from exc
 
     normalized_sheet = sheet.strip() if isinstance(sheet, str) else None
     if not normalized_sheet:
@@ -71,8 +95,8 @@ async def index_excel(
 
     try:
         df = xl.parse(actual_sheet)
-    except Exception as e:
-        raise HTTPException(400, f"Failed to read sheet '{actual_sheet}': {e}") from e
+    except Exception as exc:
+        raise HTTPException(400, f"Failed to read sheet '{actual_sheet}': {exc}") from exc
 
     digest = hashlib.sha256(data).hexdigest()[:16]
     df_original = df.copy()
@@ -154,8 +178,7 @@ async def index_excel(
                 )
             )
 
-    user_id = str(current_user.id)
-    n = upsert_chunks(chunks, user_id=user_id)
+    n = upsert_chunks(chunks, user_id=str(user_id))
 
     summary_payload = {
         "text": combined_summary,
@@ -194,7 +217,7 @@ async def index_excel(
             .where(
                 Upload.sha16 == digest,
                 Upload.sheet == actual_sheet,
-                Upload.user_id == current_user.id,
+                Upload.user_id == user_id,
             )
             .order_by(Upload.uploaded_at.desc())
             .limit(1)
@@ -205,7 +228,7 @@ async def index_excel(
             existing.rows = row_count
             existing.cols = col_count
             existing.size_bytes = size_bytes
-            existing.user_id = current_user.id
+            existing.user_id = user_id
         else:
             s.add(
                 Upload(
@@ -215,7 +238,7 @@ async def index_excel(
                     size_bytes=size_bytes,
                     rows=row_count,
                     cols=col_count,
-                    user_id=current_user.id,
+                    user_id=user_id,
                     summary=summary_payload,
                 )
             )
@@ -258,6 +281,7 @@ class MemoryUpdateRequest(BaseModel):
     sheet: str
     relationships: dict[str, str] | None = None
     analysis_plan: list[dict[str, Any]] | None = Field(default=None, alias="plan")
+    notes: list[str] | None = None
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -356,6 +380,7 @@ def get_memory(sha16: str, sheet: str, current_user: CurrentUser) -> dict[str, A
             "analysis_plan": summary.get("analysis_plan", []),
             "insights": summary.get("insights", {}),
             "aggregates": summary.get("aggregates", []),
+            "notes": summary.get("notes", []),
         }
 
 
@@ -382,12 +407,15 @@ def update_memory(payload: MemoryUpdateRequest, current_user: CurrentUser) -> di
             summary["relationships"] = payload.relationships
         if payload.analysis_plan is not None:
             summary["analysis_plan"] = payload.analysis_plan
+        if payload.notes is not None:
+            summary["notes"] = payload.notes
         rec.summary = summary
         return {
             "sha16": payload.sha16,
             "sheet": payload.sheet,
             "relationships": summary.get("relationships", {}),
             "analysis_plan": summary.get("analysis_plan", []),
+            "notes": summary.get("notes", []),
         }
 
 

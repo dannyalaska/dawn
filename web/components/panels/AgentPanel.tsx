@@ -4,17 +4,23 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { SparklesIcon, CheckCircleIcon, ExclamationTriangleIcon } from '@heroicons/react/24/outline';
 import useDawnData from '@/hooks/useDawnData';
 import AgentRunLog from '@/components/panels/AgentRunLog';
-import { fetchFeeds, runAgents } from '@/lib/api';
+import { fetchFeeds, ingestFeed, runAgents } from '@/lib/api';
 import type { AgentRunSummary, FeedRecord } from '@/lib/types';
 import { useDawnSession } from '@/context/dawn-session';
+import { useSWRConfig } from 'swr';
+import { suggestFeedMeta } from '@/lib/feed-utils';
 
 interface AgentPanelProps {
   activeFeedId?: string | null;
+  uploadFile?: File | null;
+  uploadSheet?: string | null;
+  onFeedReady?: (feed: FeedRecord) => void;
   onRun?: (result: AgentRunSummary) => void;
 }
 
-export default function AgentPanel({ activeFeedId, onRun }: AgentPanelProps) {
+export default function AgentPanel({ activeFeedId, uploadFile, uploadSheet, onFeedReady, onRun }: AgentPanelProps) {
   const { token, apiBase } = useDawnSession();
+  const { mutate } = useSWRConfig();
   const feeds = useDawnData(['feeds'], ({ token, apiBase }) => fetchFeeds({ token, apiBase }));
   const [selected, setSelected] = useState<string>(activeFeedId || '');
   const [question, setQuestion] = useState<string>('Summarize anomalies and key metrics.');
@@ -29,29 +35,36 @@ export default function AgentPanel({ activeFeedId, onRun }: AgentPanelProps) {
   const [demoRunActive, setDemoRunActive] = useState(false);
   const demoRunTimerRef = useRef<NodeJS.Timeout | null>(null);
 
+  const runAgentsFor = useCallback(
+    async (target: string, auto = false) => {
+      const res = await runAgents(
+        {
+          feed_identifier: target,
+          question,
+          refresh_context: true,
+          max_plan_steps: 12,
+          retrieval_k: 8
+        },
+        { token, apiBase }
+      );
+      setResult(res);
+      setLastRunFeed(target);
+      onRun?.(res);
+    },
+    [apiBase, onRun, question, token]
+  );
+
   const executeRun = useCallback(
     async (feedId?: string, auto = false) => {
       const target = feedId || selected;
       if (!target) {
-        setError('Select a feed before running agents');
+        setError('Select a feed before running agents.');
         return;
       }
       setPending(true);
       setError('');
       try {
-        const res = await runAgents(
-          {
-            feed_identifier: target,
-            question,
-            refresh_context: true,
-            max_plan_steps: 12,
-            retrieval_k: 8
-          },
-          { token, apiBase }
-        );
-        setResult(res);
-        setLastRunFeed(target);
-        onRun?.(res);
+        await runAgentsFor(target, auto);
       } catch (err) {
         if (!auto) {
           setError(err instanceof Error ? err.message : 'Agent run failed');
@@ -62,8 +75,37 @@ export default function AgentPanel({ activeFeedId, onRun }: AgentPanelProps) {
         setPending(false);
       }
     },
-    [selected, question, token, apiBase, onRun]
+    [runAgentsFor, selected]
   );
+
+  const handleRunLatestUpload = async () => {
+    if (!uploadFile) {
+      setError('Upload a workbook or select a feed before running agents.');
+      return;
+    }
+    setPending(true);
+    setError('');
+    try {
+      const { identifier, name } = suggestFeedMeta(uploadFile.name, uploadSheet);
+      const form = new FormData();
+      form.append('identifier', identifier);
+      form.append('name', name);
+      form.append('source_type', 'upload');
+      if (uploadSheet) {
+        form.append('sheet', uploadSheet);
+      }
+      form.append('file', uploadFile);
+      await ingestFeed(form, { token, apiBase });
+      mutate(['feeds', token, apiBase], undefined, { revalidate: true }).catch(() => undefined);
+      onFeedReady?.({ identifier, name, source_type: 'upload' });
+      setSelected(identifier);
+      await runAgentsFor(identifier, true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Agent run failed');
+    } finally {
+      setPending(false);
+    }
+  };
 
   useEffect(() => {
     if (!activeFeedId || pending) {
@@ -79,6 +121,8 @@ export default function AgentPanel({ activeFeedId, onRun }: AgentPanelProps) {
   const demoOptions = feedList.length
     ? feedList.slice(0, 4).map((feed) => feed.name)
     : ['Support Tickets', 'Revenue Forecast', 'Ops Incidents', 'Customer Health'];
+
+  const hasUpload = Boolean(uploadFile);
 
   useEffect(() => {
     const handleDemoRun = (event: Event) => {
@@ -181,6 +225,25 @@ export default function AgentPanel({ activeFeedId, onRun }: AgentPanelProps) {
             </div>
           )}
         </label>
+
+        {!selected && hasUpload && (
+          <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 p-3 text-xs text-amber-100">
+            <p className="uppercase tracking-[0.3em] text-amber-200">Latest upload detected</p>
+            <p className="mt-2 text-sm text-amber-50">{uploadFile?.name}</p>
+            {uploadSheet && (
+              <p className="mt-1 text-[11px] text-amber-100/70">Sheet: {uploadSheet}</p>
+            )}
+            <button
+              type="button"
+              onClick={handleRunLatestUpload}
+              disabled={pending}
+              className="mt-3 inline-flex items-center gap-2 rounded-full bg-gradient-to-r from-amber-400 via-pink-500 to-sky-500 px-4 py-2 text-xs font-semibold text-slate-900 shadow-aurora disabled:opacity-50"
+            >
+              <SparklesIcon className={`h-4 w-4 ${pending ? 'animate-spin-slow' : ''}`} />
+              {pending ? 'Preparing…' : 'Create feed + run agents'}
+            </button>
+          </div>
+        )}
 
         <label className="block text-sm text-slate-200">
           <span className="text-xs uppercase tracking-[0.3em] text-slate-500 mb-2 block">Question (optional)</span>

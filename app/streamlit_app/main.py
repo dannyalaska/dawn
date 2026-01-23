@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -46,6 +49,8 @@ STATE_DEFAULTS: dict[str, Any] = {
     "agent_runs": [],
     "agent_last_run": None,
     "runner_meta": None,
+    "lmstudio_models": None,
+    "lmstudio_models_error": None,
 }
 
 
@@ -208,17 +213,28 @@ def _render_llm_settings() -> None:
     updates: dict[str, str | None] = {"LLM_PROVIDER": provider_choice}
 
     if provider_choice == "ollama":
-        ollama_model = st.text_input("Ollama model", os.getenv("OLLAMA_MODEL", "llama3"))
+        ollama_model = st.text_input(
+            "Ollama model", os.getenv("OLLAMA_MODEL", "llama3"), key="ollama_model_input"
+        )
         updates["OLLAMA_MODEL"] = ollama_model.strip() or None
     elif provider_choice == "lmstudio":
         base = st.text_input(
-            "LM Studio base URL", os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234")
+            "LM Studio base URL",
+            os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234"),
+            key="lmstudio_base_input",
         )
-        model = st.text_input("LM Studio model", os.getenv("OPENAI_MODEL", "mistral-7b-instruct"))
+        model = st.text_input(
+            "LM Studio model",
+            os.getenv("OPENAI_MODEL", "mistral-7b-instruct"),
+            key="lmstudio_model_input",
+        )
         updates["OPENAI_BASE_URL"] = base.strip() or None
         updates["OPENAI_MODEL"] = model.strip() or None
+        _render_lmstudio_controls(base.strip() or None)
     elif provider_choice == "openai":
-        model = st.text_input("OpenAI model", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+        model = st.text_input(
+            "OpenAI model", os.getenv("OPENAI_MODEL", "gpt-4o-mini"), key="openai_model_input"
+        )
         key = st.text_input(
             "OpenAI API key",
             type="password",
@@ -231,6 +247,7 @@ def _render_llm_settings() -> None:
         model = st.text_input(
             "Anthropic model",
             os.getenv("ANTHROPIC_MODEL", "claude-3-sonnet-20240229"),
+            key="anthropic_model_input",
         )
         key = st.text_input(
             "Anthropic API key",
@@ -245,6 +262,168 @@ def _render_llm_settings() -> None:
         _persist_env_vars(updates)
         st.session_state["llm_provider"] = provider_choice
         st.success("Preferences saved. Restart the backend services if required.")
+
+
+def _render_lmstudio_controls(base_url: str | None) -> None:
+    with st.expander("LM Studio model manager", expanded=False):
+        st.caption("Requires the LM Studio server and CLI. Start it with `lms server start`.")
+
+        if st.button("Refresh LM Studio models", width="stretch"):
+            try:
+                st.session_state["lmstudio_models"] = _fetch_lmstudio_models(base_url)
+                st.session_state["lmstudio_models_error"] = None
+            except Exception as exc:  # noqa: BLE001
+                st.session_state["lmstudio_models"] = None
+                st.session_state["lmstudio_models_error"] = str(exc)
+
+        error = st.session_state.get("lmstudio_models_error")
+        if error:
+            st.error(f"LM Studio models unavailable: {error}")
+
+        models = st.session_state.get("lmstudio_models") or []
+        if not models:
+            st.info("Click refresh to load available models.")
+            return
+
+        loaded = [model for model in models if model.get("state") == "loaded"]
+        st.write(f"Loaded models: {len(loaded)}")
+
+        table_rows: list[dict[str, Any]] = []
+        model_key_map: dict[str, str] = {}
+        for model in models:
+            model_id = model.get("id", "")
+            model_key = _lmstudio_model_key(model)
+            if model_id:
+                model_key_map[str(model_id)] = model_key or str(model_id)
+            table_rows.append(
+                {
+                    "id": model_id,
+                    "publisher": model.get("publisher", ""),
+                    "state": model.get("state", ""),
+                    "type": model.get("type", ""),
+                    "quantization": model.get("quantization", ""),
+                    "max_context": model.get("max_context_length", ""),
+                }
+            )
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+        model_ids = [model.get("id") for model in models if model.get("id")]
+        if not model_ids:
+            st.warning("No model identifiers returned by LM Studio.")
+            return
+
+        default_model = os.getenv("OPENAI_MODEL") or (
+            loaded[0].get("id") if loaded else model_ids[0]
+        )
+        if default_model not in model_ids:
+            default_model = model_ids[0]
+        selected_model = st.selectbox(
+            "Select model",
+            options=model_ids,
+            index=model_ids.index(default_model),
+            key="lmstudio_model_select",
+        )
+
+        selected_state: dict[str, Any] = next(
+            (m for m in models if m.get("id") == selected_model), {}
+        )
+        is_loaded = selected_state.get("state") == "loaded"
+        selected_key = model_key_map.get(str(selected_model), str(selected_model))
+        st.caption(f"CLI model key: {selected_key}")
+
+        with st.expander("Advanced load options", expanded=False):
+            identifier = st.text_input(
+                "Identifier (optional)",
+                value=selected_model,
+                help="Overrides the model name exposed via the API.",
+                key="lmstudio_identifier_input",
+            )
+            context_length = st.number_input(
+                "Context length (optional)",
+                min_value=0,
+                max_value=65536,
+                value=0,
+                step=256,
+                help="Set to 0 to use the model default.",
+                key="lmstudio_context_length_input",
+            )
+            gpu_setting = st.text_input(
+                "GPU setting (optional)",
+                value="",
+                help="Example: max, auto, or a specific GPU preset supported by LM Studio.",
+                key="lmstudio_gpu_input",
+            )
+            ttl_seconds = st.number_input(
+                "Unload after (seconds, optional)",
+                min_value=0,
+                max_value=86_400,
+                value=0,
+                step=60,
+                help="Set to 0 to disable automatic unload.",
+                key="lmstudio_ttl_input",
+            )
+
+        action_col, eject_col, swap_col = st.columns(3)
+        with action_col:
+            if st.button("Load", disabled=is_loaded, width="stretch"):
+                try:
+                    _lmstudio_load_model(
+                        selected_key,
+                        base_url=base_url,
+                        identifier=identifier.strip() or None,
+                        context_length=int(context_length) or None,
+                        gpu=gpu_setting.strip() or None,
+                        ttl_seconds=int(ttl_seconds) or None,
+                    )
+                    st.success(f"Loaded {selected_model}")
+                    st.session_state["lmstudio_models"] = _fetch_lmstudio_models(base_url)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Load failed: {exc}")
+
+        with eject_col:
+            if st.button("Eject", disabled=not is_loaded, width="stretch"):
+                try:
+                    _lmstudio_unload_model(selected_key, base_url=base_url)
+                    st.success(f"Ejected {selected_model}")
+                    st.session_state["lmstudio_models"] = _fetch_lmstudio_models(base_url)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Eject failed: {exc}")
+            if st.button("Eject all", width="stretch"):
+                try:
+                    _lmstudio_unload_model(None, base_url=base_url, unload_all=True)
+                    st.success("All models unloaded")
+                    st.session_state["lmstudio_models"] = _fetch_lmstudio_models(base_url)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Eject failed: {exc}")
+
+        with swap_col:
+            unload_first = st.checkbox("Unload others before swap", value=True)
+            if st.button("Swap + use", width="stretch"):
+                try:
+                    api_model_name = identifier.strip() or selected_model
+                    if unload_first:
+                        _lmstudio_unload_model(None, base_url=base_url, unload_all=True)
+                    _lmstudio_load_model(
+                        selected_key,
+                        base_url=base_url,
+                        identifier=api_model_name or None,
+                        context_length=int(context_length) or None,
+                        gpu=gpu_setting.strip() or None,
+                        ttl_seconds=int(ttl_seconds) or None,
+                    )
+                    _persist_env_vars(
+                        {
+                            "LLM_PROVIDER": "lmstudio",
+                            "OPENAI_MODEL": api_model_name,
+                            "OPENAI_BASE_URL": base_url or None,
+                        }
+                    )
+                    st.session_state["llm_provider"] = "lmstudio"
+                    st.session_state["lmstudio_model_input"] = api_model_name
+                    st.success(f"Swapped to {api_model_name}")
+                    st.session_state["lmstudio_models"] = _fetch_lmstudio_models(base_url)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Swap failed: {exc}")
 
 
 def _render_account_panel() -> None:
@@ -1001,6 +1180,100 @@ def _render_runner_tab(embedded: bool = False) -> None:
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+
+def _lmstudio_rest_base(base_url: str | None) -> str:
+    base = base_url or os.getenv("OPENAI_BASE_URL") or "http://127.0.0.1:1234"
+    base = base.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return base
+
+
+def _lmstudio_host(base_url: str | None) -> str | None:
+    raw = base_url or os.getenv("OPENAI_BASE_URL") or "http://127.0.0.1:1234"
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    parsed = urlparse(raw)
+    host = parsed.netloc or parsed.path
+    return host or None
+
+
+def _lmstudio_model_key(model: dict[str, Any]) -> str:
+    model_id = str(model.get("id") or "")
+    publisher = str(model.get("publisher") or "")
+    if not model_id:
+        return ""
+    if "/" in model_id or not publisher:
+        return model_id
+    return f"{publisher}/{model_id}"
+
+
+def _fetch_lmstudio_models(base_url: str | None) -> list[dict[str, Any]]:
+    rest_base = _lmstudio_rest_base(base_url)
+    url = f"{rest_base}/api/v0/models"
+    response = requests.get(url, timeout=5)
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return data
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _run_lms_command(args: list[str], *, base_url: str | None, timeout: int = 60) -> str:
+    lms_path = shutil.which("lms")
+    if not lms_path:
+        raise RuntimeError("LM Studio CLI ('lms') not found. Install it or add to PATH.")
+    host = _lmstudio_host(base_url)
+    cmd = [lms_path, *args]
+    if host:
+        cmd.extend(["--host", host])
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(message or "LM Studio CLI command failed.")
+    return (result.stdout or "").strip()
+
+
+def _lmstudio_load_model(
+    model_key: str,
+    *,
+    base_url: str | None,
+    identifier: str | None = None,
+    context_length: int | None = None,
+    gpu: str | None = None,
+    ttl_seconds: int | None = None,
+) -> str:
+    args = ["load", model_key]
+    if identifier:
+        args.extend(["--identifier", identifier])
+    if context_length:
+        args.extend(["--context-length", str(context_length)])
+    if gpu:
+        args.extend(["--gpu", gpu])
+    if ttl_seconds:
+        args.extend(["--ttl", str(ttl_seconds)])
+    return _run_lms_command(args, base_url=base_url)
+
+
+def _lmstudio_unload_model(
+    model_key: str | None,
+    *,
+    base_url: str | None,
+    unload_all: bool = False,
+) -> str:
+    args = ["unload"]
+    if unload_all:
+        args.append("--all")
+    elif model_key:
+        args.append(model_key)
+    else:
+        raise RuntimeError("Model key required to unload a specific model.")
+    return _run_lms_command(args, base_url=base_url)
 
 
 def _request_json(

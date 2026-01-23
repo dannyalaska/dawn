@@ -63,6 +63,7 @@ export interface MemoryPayload {
   analysis_plan: Array<Record<string, unknown>>;
   insights: Record<string, unknown>;
   aggregates: Array<Record<string, unknown>>;
+  notes?: string[];
 }
 
 export interface RunnerMeta {
@@ -193,4 +194,38 @@ export interface RagChatResponse {
   sources: Array<Record<string, unknown>>;
   messages: RagMessage[];
   direct_answer?: boolean;
+}
+
+export interface NL2SQLResponse {
+  sql: string;
+  validation: {
+    ok: boolean;
+    errors?: string[];
+    warnings?: string[];
+    tables?: string[];
+    columns?: string[];
+  };
+  citations?: {
+    tables?: string[];
+    columns?: string[];
+    context?: Array<Record<string, unknown>>;
+  };
+  explain?: string | null;
+}
+
+export interface LMStudioModel {
+  id: string;
+  publisher?: string | null;
+  state?: string | null;
+  type?: string | null;
+  quantization?: string | null;
+  max_context_length?: number | null;
+  model_key: string;
+  display_name?: string | null;
+}
+
+export interface LMStudioModelsResponse {
+  models: LMStudioModel[];
+  base_url: string;
+  cli_available: boolean;
 }

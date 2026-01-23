@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -17,6 +18,7 @@ from app.core.runner_meta import gather_runner_stats
 from app.core.scheduler import get_scheduler
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+logger = logging.getLogger(__name__)
 
 
 class JobCreateRequest(BaseModel):
@@ -54,7 +56,7 @@ def jobs_create(payload: JobCreateRequest, current_user: CurrentUser) -> dict[st
                 scheduler.add_job(job["id"], payload.schedule)
             except Exception as exc:  # noqa: BLE001
                 # Log but don't fail - job is still created
-                print(f"[jobs] Failed to schedule job {job['id']}: {exc}")
+                logger.warning("Failed to schedule job %s: %s", job["id"], exc, exc_info=True)
     except JobError as exc:
         raise HTTPException(400, str(exc)) from exc
     return job

@@ -1,23 +1,27 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections.abc import Iterable
+from contextlib import suppress
 from datetime import date, datetime
 from difflib import SequenceMatcher
 from hashlib import sha256
 from io import BytesIO
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 import numpy as np
 import pandas as pd
 import requests
-from sqlalchemy import func, select
+from sqlalchemy import Table, func, select
 
+from app.core.config import settings
 from app.core.db import get_engine, session_scope
 from app.core.dq import sync_auto_rules
 from app.core.excel.summary import ColumnSummary, DatasetMetric, summarize_dataframe
+from app.core.limits import SizeLimitError, read_stream_bytes
 from app.core.models import Feed, FeedDataset, FeedVersion
 from app.core.rag import Chunk, simple_chunker, upsert_chunks
 from app.core.redis_client import redis_sync
@@ -32,6 +36,7 @@ FEED_SOURCE_KINDS = {"upload", "s3", "http"}
 DATA_FORMATS = {"excel", "csv"}
 MAX_DATASET_ROWS = int(os.getenv("DAWN_MAX_DATASET_ROWS", "200000"))
 DATASET_TABLE_PREFIX = "dawn_feed_"
+logger = logging.getLogger(__name__)
 
 
 def _infer_format(filename: str | None, declared: str | None) -> str:
@@ -83,21 +88,43 @@ def _fetch_s3_bytes(path: str | None) -> bytes:
         bucket = bucket_name()
     client = s3()
     resp = client.get_object(Bucket=bucket, Key=key)
+    content_len = resp.get("ContentLength")
+    _enforce_remote_limit(content_len, f"S3 object {path or key}")
     body = resp.get("Body")
     if body is None:
         raise FeedIngestError(f"Empty S3 object for path {path!r}")
-    return body.read()
+    try:
+        return read_stream_bytes(body, label=f"S3 object {path or key}")
+    except SizeLimitError as exc:
+        raise FeedIngestError(str(exc)) from exc
 
 
 def _fetch_http_bytes(url: str | None) -> bytes:
     if not url:
         raise FeedIngestError("http_url must be provided for source_type='http'.")
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=10, stream=True)
         resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
         raise FeedIngestError(f"Failed to download {url!r}: {exc}") from exc
-    return resp.content
+    content_len = resp.headers.get("Content-Length")
+    if content_len:
+        with suppress(ValueError):
+            _enforce_remote_limit(int(content_len), f"HTTP download {url}")
+    try:
+        return read_stream_bytes(cast(BinaryIO, resp.raw), label=f"HTTP download {url}")
+    except SizeLimitError as exc:
+        raise FeedIngestError(str(exc)) from exc
+    finally:
+        resp.close()
+
+
+def _enforce_remote_limit(size: int | None, label: str) -> None:
+    limit = settings.MAX_REMOTE_BYTES
+    if limit <= 0 or size is None:
+        return
+    if size > limit:
+        raise FeedIngestError(f"{label} exceeds limit ({size} bytes > {limit} bytes).")
 
 
 def _collect_existing_columns(
@@ -185,7 +212,8 @@ def _record_dataset(
     columns: list[str],
 ) -> dict[str, Any]:
     with session_scope() as session:
-        FeedDataset.__table__.create(bind=session.get_bind(), checkfirst=True)
+        table = cast(Table, FeedDataset.__table__)
+        table.create(bind=session.get_bind(), checkfirst=True)
         existing = (
             session.execute(
                 select(FeedDataset).where(FeedDataset.feed_version_id == feed_version_id)
@@ -856,11 +884,11 @@ def ingest_feed(
             identifier, version_number, summary_payload, markdown_doc, user_id=user_id
         )
     except Exception as exc:  # noqa: BLE001
-        print(f"[feed-ingest] redis persist failed: {exc}")
+        logger.warning("Redis persist failed: %s", exc, exc_info=True)
     try:
         _chunk_summary(identifier, version_number, markdown_doc, user_id=user_id)
     except Exception as exc:  # noqa: BLE001
-        print(f"[feed-ingest] chunk embedding failed: {exc}")
+        logger.warning("Chunk embedding failed: %s", exc, exc_info=True)
 
     if pending_dataset:
         write_result = _write_dataset_table(

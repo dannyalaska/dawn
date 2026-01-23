@@ -58,6 +58,10 @@ Ingest a new feed or create a new version of an existing feed.
 }
 ```
 
+**Notes:**
+- Uploads larger than `MAX_UPLOAD_BYTES` return `413 Payload Too Large`.
+- Remote sources (S3/HTTP) larger than `MAX_REMOTE_BYTES` are rejected.
+
 **Example (Upload):**
 ```python
 import requests
@@ -432,6 +436,7 @@ Trigger the coordinated multi-agent workflow for a given feed.
 ```
 
 Agents persist metric summaries into Redis when `refresh_context` is true, so subsequent chat questions inherit the latest context without re-ingesting the feed.
+Plan entries now include `rationale` and `intent` fields to explain why each step exists.
 
 ---
 

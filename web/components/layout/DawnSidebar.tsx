@@ -5,12 +5,14 @@ import AuthPanel from '@/components/panels/AuthPanel';
 import ServiceStatusPanel from '@/components/panels/ServiceStatusPanel';
 import RunnerMiniPanel from '@/components/panels/RunnerMiniPanel';
 import BackendPanel from '@/components/panels/BackendPanel';
+import LmStudioPanel from '@/components/panels/LmStudioPanel';
 import Link from 'next/link';
 import Image from 'next/image';
 import { ChevronDownIcon } from '@heroicons/react/24/outline';
 
 export default function DawnSidebar() {
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
+    lmstudio: true,
     auth: true,
     system: true,
     jobs: false,
@@ -43,6 +45,24 @@ export default function DawnSidebar() {
 
       {/* Collapsible Sections */}
       <div className="space-y-3">
+        {/* LM Studio */}
+        <div className="glass-panel rounded-2xl p-4 space-y-3">
+          <button
+            onClick={() => toggleSection('lmstudio')}
+            className="flex items-center justify-between w-full text-xs uppercase tracking-[0.3em] font-semibold text-slate-400 hover:text-slate-300 transition-colors"
+          >
+            <span>LM Studio</span>
+            <ChevronDownIcon
+              className={`h-4 w-4 transition-transform ${expandedSections.lmstudio ? 'rotate-180' : ''}`}
+            />
+          </button>
+          {expandedSections.lmstudio && (
+            <div>
+              <LmStudioPanel />
+            </div>
+          )}
+        </div>
+
         {/* Authentication */}
         <div className="glass-panel rounded-2xl p-4 space-y-3">
           <button

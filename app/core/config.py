@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     S3_BUCKET: str | None = None
     S3_ENDPOINT_URL: str | None = None
 
+    # Dependency enforcement (dev-only showcase defaults)
+    REQUIRE_REDIS: bool = True
+    REQUIRE_POSTGRES: bool = True
+
+    # Upload and remote fetch limits (bytes)
+    MAX_UPLOAD_BYTES: int = 25_000_000
+    MAX_REMOTE_BYTES: int = 25_000_000
+
     # LLM knobs (safe defaults; can be overridden via .env)
     LLM_PROVIDER: str = "stub"  # stub | ollama | openai
     OPENAI_API_KEY: str | None = None

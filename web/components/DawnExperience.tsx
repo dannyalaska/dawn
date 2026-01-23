@@ -37,6 +37,7 @@ export default function DawnExperience() {
   const [preview, setPreview] = useState<PreviewTable | null>(null);
   const [profile, setProfile] = useState<IndexExcelResponse | null>(null);
   const [activeFeed, setActiveFeed] = useState<FeedRecord | null>(null);
+  const [lastUploadFile, setLastUploadFile] = useState<File | null>(null);
   const [agentResult, setAgentResult] = useState<AgentRunSummary | null>(null);
   const [activities, setActivities] = useState<ActivityItem[]>([]);
   const [expandedTileId, setExpandedTileId] = useState<string | null>(null);
@@ -169,6 +170,7 @@ export default function DawnExperience() {
         priority: 1,
         render: () => (
           <UploadPanel
+            onFileSelected={setLastUploadFile}
             onPreviewed={(data) => {
               setPreview(data);
               if (data) {
@@ -207,7 +209,15 @@ export default function DawnExperience() {
         description: 'Run multi-agent analysis and reports.',
         preview: 'Launch an agent swarm for deeper insights.',
         accent: 'from-pink-500/20 via-rose-400/10 to-amber-300/20',
-        render: () => <AgentPanel activeFeedId={activeFeed?.identifier} onRun={(res) => setAgentResult(res)} />
+        render: () => (
+          <AgentPanel
+            activeFeedId={activeFeed?.identifier}
+            uploadFile={lastUploadFile}
+            uploadSheet={preview?.sheet ?? profile?.sheet ?? null}
+            onFeedReady={(feed) => setActiveFeed(feed)}
+            onRun={(res) => setAgentResult(res)}
+          />
+        )
       },
       contextChat: {
         title: 'Context chat',
@@ -215,7 +225,20 @@ export default function DawnExperience() {
         description: 'Ask questions and get cited answers.',
         preview: 'Chat with your data using retrieval.',
         accent: 'from-emerald-400/20 via-lime-300/10 to-amber-300/20',
-        render: () => <ContextChatPanel disabled={!profile} />
+        render: () => (
+          <ContextChatPanel
+            disabled={!source && !activeFeed}
+            source={source ?? null}
+            activeFeedId={activeFeed?.identifier ?? null}
+            memory={
+              preview?.sha16 && (preview?.sheet || profile?.sheet)
+                ? { sha16: preview.sha16, sheet: (preview.sheet ?? profile?.sheet) as string }
+                : profile?.sha16 && profile?.sheet
+                  ? { sha16: profile.sha16, sheet: profile.sheet }
+                  : null
+            }
+          />
+        )
       },
       agentOrbit: {
         title: 'Swarm telemetry',
@@ -247,7 +270,14 @@ export default function DawnExperience() {
         description: 'Register feeds for ongoing analysis.',
         preview: 'Connect datasets for continuous updates.',
         accent: 'from-emerald-300/20 via-teal-300/10 to-sky-300/20',
-        render: () => <FeedIngestPanel />
+        render: () => (
+          <FeedIngestPanel
+            defaultFile={lastUploadFile}
+            defaultSheet={preview?.sheet ?? profile?.sheet ?? null}
+            sheetOptions={preview?.sheet_names ?? []}
+            onFeedReady={(feed) => setActiveFeed(feed)}
+          />
+        )
       },
       actionPlan: {
         title: 'Action plan',

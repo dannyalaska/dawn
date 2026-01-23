@@ -4,12 +4,14 @@ from typing import Any
 
 from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi import File as UploadFileParam
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.core.auth import CurrentUser
 from app.core.db import session_scope
 from app.core.feed_ingest import FeedIngestError, ingest_feed
+from app.core.limits import SizeLimitError, read_upload_bytes
 from app.core.models import Feed, FeedVersion
 
 router = APIRouter(prefix="/feeds", tags=["feeds"])
@@ -33,12 +35,17 @@ async def feed_ingest(
     current_user: CurrentUser,
 ) -> dict[str, Any]:
     try:
-        file_bytes = await file.read() if file is not None else None
+        file_bytes = (
+            await read_upload_bytes(file, label="Feed upload") if file is not None else None
+        )
+    except SizeLimitError as exc:
+        raise HTTPException(413, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"Failed to read uploaded file: {exc}") from exc
 
     try:
-        result = ingest_feed(
+        result = await run_in_threadpool(
+            ingest_feed,
             identifier=identifier.strip(),
             name=name.strip(),
             source_kind=source_type,

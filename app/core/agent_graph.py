@@ -30,6 +30,8 @@ class AgentTask(TypedDict, total=False):
     description: str
     payload: dict[str, Any]
     status: str
+    rationale: str
+    intent: str
 
 
 class AgentResult(TypedDict, total=False):
@@ -37,9 +39,18 @@ class AgentResult(TypedDict, total=False):
     type: str
     description: str
     data: Any
+    rationale: str
+
+
+class BackendConn(TypedDict):
+    id: int
+    name: str
+    kind: str
+    config: dict[str, Any]
 
 
 class AgentState(TypedDict, total=False):
+    goal: str
     user_id: str
     feed_identifier: str
     feed_name: str
@@ -120,7 +131,7 @@ def _load_backend_sources(user_id: str) -> list[dict[str, Any]]:
             .join(Feed, FeedDataset.feed_id == Feed.id)
             .where(Feed.user_id == numeric_user)
         ).all()
-        connections = [
+        connections: list[BackendConn] = [
             {
                 "id": conn.id,
                 "name": conn.name,
@@ -230,7 +241,7 @@ def _derive_plan(
     plan: list[dict[str, Any]] = []
     for entry in raw_plan:
         if isinstance(entry, dict) and entry.get("type"):
-            plan.append(entry)
+            plan.append(_decorate_plan_entry(entry))
         if len(plan) >= limit:
             break
 
@@ -238,7 +249,7 @@ def _derive_plan(
         insights = summary.get("insights") or {}
         if isinstance(insights, dict):
             for column in insights:
-                plan.append({"type": "count_by", "column": column})
+                plan.append(_decorate_plan_entry({"type": "count_by", "column": column}))
                 if len(plan) >= limit:
                     break
 
@@ -249,12 +260,14 @@ def _derive_plan(
                 if not isinstance(agg, dict):
                     continue
                 plan.append(
-                    {
-                        "type": agg.get("stat", "avg_by"),
-                        "group": agg.get("group"),
-                        "value": agg.get("value"),
-                        "stat": agg.get("stat", "mean"),
-                    }
+                    _decorate_plan_entry(
+                        {
+                            "type": agg.get("stat", "avg_by"),
+                            "group": agg.get("group"),
+                            "value": agg.get("value"),
+                            "stat": agg.get("stat", "mean"),
+                        }
+                    )
                 )
                 if len(plan) >= limit:
                     break
@@ -279,15 +292,46 @@ def _extend_plan_with_backends(
             if not schema_name:
                 continue
             plan.append(
-                {
-                    "type": "schema_inventory",
-                    "schema": schema_name,
-                    "connection_id": source.get("id"),
-                    "connection_name": source.get("name"),
-                    "kind": source.get("kind"),
-                }
+                _decorate_plan_entry(
+                    {
+                        "type": "schema_inventory",
+                        "schema": schema_name,
+                        "connection_id": source.get("id"),
+                        "connection_name": source.get("name"),
+                        "kind": source.get("kind"),
+                    }
+                )
             )
     return plan
+
+
+def _decorate_plan_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(entry)
+    enriched.setdefault("rationale", _plan_rationale(enriched))
+    enriched.setdefault("intent", _plan_intent(enriched))
+    return enriched
+
+
+def _plan_rationale(entry: dict[str, Any]) -> str:
+    task_type = str(entry.get("type") or "task")
+    if task_type == "count_by":
+        return "Summarize categorical distribution to reveal top segments."
+    if task_type in {"avg_by", "mean_by"}:
+        return "Estimate averages across groups to surface best/worst performers."
+    if task_type == "schema_inventory":
+        return "Map external schemas for cross-dataset validation or joins."
+    return "Derive a targeted insight from available profile metadata."
+
+
+def _plan_intent(entry: dict[str, Any]) -> str:
+    task_type = str(entry.get("type") or "task")
+    if task_type == "count_by":
+        return "Quantify frequency distribution."
+    if task_type in {"avg_by", "mean_by"}:
+        return "Compare group-level numeric signals."
+    if task_type == "schema_inventory":
+        return "Summarize available tables and columns."
+    return "Execute a targeted data insight step."
 
 
 def _task_description(entry: dict[str, Any]) -> str:
@@ -305,11 +349,17 @@ def _task_description(entry: dict[str, Any]) -> str:
     return f"Execute plan step: {task_type}"
 
 
+def _task_rationale(task: AgentTask) -> str:
+    return str(task.get("rationale") or "")
+
+
 def _build_tasks(
     plan: list[dict[str, Any]], *, existing: list[AgentTask] | None = None
 ) -> list[AgentTask]:
     tasks: list[AgentTask] = []
     for entry in plan:
+        rationale = str(entry.get("rationale") or _plan_rationale(entry))
+        intent = str(entry.get("intent") or _plan_intent(entry))
         tasks.append(
             AgentTask(
                 id=uuid.uuid4().hex[:12],
@@ -317,6 +367,8 @@ def _build_tasks(
                 description=_task_description(entry),
                 payload=dict(entry),
                 status="pending",
+                rationale=rationale,
+                intent=intent,
             )
         )
     if existing:
@@ -344,6 +396,7 @@ def _execute_task(
                 type=task_type,
                 description=task["description"],
                 data={"column": column, "counts": counts},
+                rationale=_task_rationale(task),
             )
         else:
             warnings.append(f"No value counts available for column {column!r}.")
@@ -365,6 +418,7 @@ def _execute_task(
                     "best": aggregate_match.get("best", []),
                     "worst": aggregate_match.get("worst", []),
                 },
+                rationale=_task_rationale(task),
             )
         else:
             warnings.append(f"No aggregate metrics found for {value!r} by {group!r}.")
@@ -381,6 +435,7 @@ def _execute_task(
             type=task_type or "task",
             description=task["description"],
             data=fallback_data,
+            rationale=_task_rationale(task),
         )
         if fallback_warning:
             warnings.append(fallback_warning)
@@ -464,6 +519,7 @@ def _execute_schema_inventory(
                 "schema": schema_name,
                 "error": source.get("error"),
             },
+            rationale=_task_rationale(task),
         )
         return result, None
     schema_details = next(
@@ -487,6 +543,7 @@ def _execute_schema_inventory(
             "tables": preview,
             "table_count": len(tables),
         },
+        rationale=_task_rationale(task),
     )
     return result, None
 
@@ -570,6 +627,24 @@ def _summarise_result(result: AgentResult) -> str:
     return f"{result.get('description')}: {note}"
 
 
+def _needs_context_notes(state: AgentState) -> bool:
+    warnings = state.get("warnings", [])
+    completed = state.get("completed", [])
+    if not completed:
+        return True
+    for warning in warnings:
+        if "No value counts available" in warning or "No aggregate metrics found" in warning:
+            return True
+    return False
+
+
+def _context_note_prompt(feed_identifier: str) -> str:
+    return (
+        "Deterministic metrics were limited. Add context notes (e.g., column meanings or "
+        "business rules) via POST /rag/context/note and rerun /agents/analyze for richer results."
+    )
+
+
 def _needs_qa(state: AgentState) -> str:
     question = state.get("question", "")
     if question and question.strip():
@@ -599,6 +674,7 @@ def _compiled_graph() -> Any:
             "message": "Feed summary loaded.",
             "feed_version": snapshot["feed_version"],
             "backend_sources": len(backend_sources),
+            "goal": state.get("goal"),
         }
         return {
             "feed_name": snapshot["feed_name"],
@@ -620,6 +696,7 @@ def _compiled_graph() -> Any:
         log_entry = {
             "agent": "planner",
             "message": f"Planner produced {len(plan)} steps.",
+            "goal": state.get("goal"),
         }
         return {
             "plan": plan,
@@ -735,6 +812,8 @@ def _compiled_graph() -> Any:
         warnings = list(state.get("warnings", []))
         if not state.get("completed"):
             warnings.append("No tasks completed; results may be incomplete.")
+        if _needs_context_notes(state):
+            warnings.append(_context_note_prompt(state.get("feed_identifier", "this feed")))
         log_entry: dict[str, Any] = {
             "agent": "guardrail",
             "message": "Validation complete.",
@@ -747,6 +826,10 @@ def _compiled_graph() -> Any:
 
     def respond_node(state: AgentState) -> dict[str, Any]:
         lines = []
+        goal = state.get("goal")
+        if goal:
+            lines.append(f"Goal: {goal}")
+            lines.append("")
         for result in state.get("completed", []):
             lines.append(f"- {result['description']}: {_summarise_result(result)}")
         answer = state.get("answer")
@@ -803,7 +886,13 @@ def run_multi_agent_session(
         raise AgentRunError("feed_identifier is required.")
     backend_sources = _load_backend_sources(user_id)
 
+    default_goal = (
+        question.strip()
+        if question and question.strip()
+        else f"Generate a metrics plan and insights for {feed_identifier}."
+    )
     initial_state: AgentState = {
+        "goal": default_goal,
         "user_id": user_id,
         "feed_identifier": feed_identifier,
         "plan": [],

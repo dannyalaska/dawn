@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -17,21 +18,25 @@ from app.api.demo import router as demo_router
 from app.api.excel import router as excel_router
 from app.api.feeds import router as feeds_router
 from app.api.jobs import router as jobs_router
+from app.api.lmstudio import router as lmstudio_router
 from app.api.nl_sql import router as nl_router
 from app.api.rag import router as rag_router
 from app.api.transforms import router as transforms_router
 from app.core.auth import ensure_default_user
 from app.core.backend_seed import seed_backend_connections
 from app.core.config import settings
-from app.core.db import init_database, session_scope
+from app.core.db import get_engine, init_database, session_scope
 from app.core.rag import _ensure_index  # type: ignore[attr-defined]
 from app.core.redis_client import redis_async, redis_sync
 from app.core.scheduler import start_scheduler, stop_scheduler
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan handler that wires up shared infrastructure."""
+    _require_dependencies()
     init_database()
     default_user = ensure_default_user()
     seed_backend_connections(default_user.id)
@@ -40,14 +45,14 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         start_scheduler()
     except Exception as exc:  # noqa: BLE001
-        print(f"[server] Failed to start scheduler: {exc}")
+        logger.warning("Failed to start scheduler: %s", exc, exc_info=True)
     try:
         yield
     finally:
         try:
             stop_scheduler()
         except Exception as exc:  # noqa: BLE001
-            print(f"[server] Error stopping scheduler: {exc}")
+            logger.warning("Error stopping scheduler: %s", exc, exc_info=True)
 
 
 app = FastAPI(title="DAWN API", lifespan=_lifespan)
@@ -116,6 +121,33 @@ def _check_llm() -> dict[str, Any]:
     return {"provider": provider or "stub", "ok": ok, "detail": detail}
 
 
+def _require_dependencies() -> None:
+    errors: list[str] = []
+    if settings.REQUIRE_REDIS:
+        try:
+            redis_sync.ping()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Redis unavailable: {exc}")
+
+    if settings.REQUIRE_POSTGRES:
+        dsn = os.getenv("POSTGRES_DSN") or settings.POSTGRES_DSN
+        if not dsn:
+            errors.append("POSTGRES_DSN is required when REQUIRE_POSTGRES=true.")
+        else:
+            engine = get_engine()
+            if engine.dialect.name != "postgresql":
+                errors.append("POSTGRES_DSN must point to a Postgres database.")
+            else:
+                try:
+                    with engine.connect() as conn:
+                        conn.execute(text("SELECT 1"))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"Postgres unavailable: {exc}")
+
+    if errors:
+        raise RuntimeError("Startup dependency check failed: " + "; ".join(errors))
+
+
 @app.get("/health")
 async def health():
     redis_ok = await _check_redis()
@@ -162,3 +194,4 @@ app.include_router(transforms_router)
 app.include_router(nl_router)
 app.include_router(jobs_router)
 app.include_router(agents_router)
+app.include_router(lmstudio_router)

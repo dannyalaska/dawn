@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import logging
 from hashlib import sha256
 from typing import Any
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import delete, desc, select
 
 from app.core.auth import CurrentUser
 from app.core.db import session_scope
 from app.core.excel.ingestion import preview_from_bytes
+from app.core.limits import SizeLimitError, read_upload_bytes
 from app.core.models import Upload
 from app.core.redis_client import redis_sync
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
+logger = logging.getLogger(__name__)
 
 # Avoid B008: evaluate File(...) at import time, not in the signature default
 file_param = File(...)
@@ -28,9 +32,17 @@ async def preview(
     fname = (file.filename or "").lower()
     if not fname.endswith((".xlsx", ".xlsm", ".xls")):
         raise HTTPException(400, "Only Excel files are supported (.xlsx, .xlsm, .xls)")
-    content = await file.read()
     try:
-        table = preview_from_bytes(content, sheet_name=sheet, user_id=str(current_user.id))
+        content = await read_upload_bytes(file, label="Excel preview")
+    except SizeLimitError as exc:
+        raise HTTPException(413, str(exc)) from exc
+    try:
+        table = await run_in_threadpool(
+            preview_from_bytes,
+            content,
+            sheet_name=sheet,
+            user_id=str(current_user.id),
+        )
     except Exception as e:
         # keep original error chained for logs/tracebacks
         raise HTTPException(400, f"Failed to read Excel: {e}") from e
@@ -40,7 +52,7 @@ async def preview(
     rows, cols = table.shape
 
     # Best-effort persistence; don't block preview on DB failure
-    try:
+    def _persist_upload() -> None:
         with session_scope() as s:
             s.add(
                 Upload(
@@ -53,9 +65,11 @@ async def preview(
                     user_id=current_user.id,
                 )
             )
+
+    try:
+        await run_in_threadpool(_persist_upload)
     except Exception as err:
-        # TODO: switch to structured logging later
-        print(f"[uploads] persist failed: {err}")
+        logger.warning("Upload persist failed: %s", err, exc_info=True)
 
     return {
         "sheet": table.name,
