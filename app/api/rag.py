@@ -64,6 +64,7 @@ async def index_excel(
     )
 
 
+# validates sheet name, extracts dataframe, summarizes, chunks, and upserts to the vector store in Redis
 def _index_excel_sync(
     data: bytes,
     name: str,
@@ -111,6 +112,7 @@ def _index_excel_sync(
             summary_lines.append(f"{metric.description or metric.column}: {values_preview}")
     combined_summary = "\n".join(summary_lines)
 
+    # tag inference based on column names
     def _infer_dataset_tags() -> list[str]:
         tags: set[str] = set()
         names = [cs.name.lower() for cs in column_summaries]

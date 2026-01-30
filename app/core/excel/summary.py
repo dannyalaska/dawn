@@ -46,6 +46,9 @@ def _relationship_hint(col_name: str, dtype: str) -> str | None:
     return None
 
 
+# Create a lightweight textual + structured summary for the dataframe
+# this is what enables the RAG layer to reason about the dataset
+# numerical vs categorical columns, top values, basic stats, etc.
 def summarize_dataframe(
     df: pd.DataFrame, *, max_values: int = 5
 ) -> tuple[str, list[ColumnSummary], list[DatasetMetric], dict[str, object]]:

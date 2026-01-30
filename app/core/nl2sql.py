@@ -299,16 +299,23 @@ def _rag_block(
 
 
 def _prompt(
-    question: str, manifest: list[TableManifest], recent: list[str], rag_context: str
+    question: str,
+    manifest: list[TableManifest],
+    recent: list[str],
+    rag_context: str,
+    intent: dict[str, Any] | None = None,
 ) -> str:
     schema_text = _schema_block(manifest)
     recent_text = _recent_block(recent)
+    intent_text = json.dumps(intent, ensure_ascii=True, indent=2) if intent else "(none)"
     guidance = textwrap.dedent(
         f"""
         You convert natural-language analytics questions into SQL.
         Use ONLY the tables and columns listed below. Avoid guessing names.
+        Preserve exact column names; if a column has spaces or mixed case, wrap it in double quotes.
         Output a single SQL statement, no narration, no markdown fences.
         Prefer safe read-only queries (`SELECT`, `WITH`).
+        If asked about duplicates, use GROUP BY with HAVING COUNT(*) > 1.
         Tables available:
         {schema_text}
 
@@ -318,10 +325,153 @@ def _prompt(
         Retrieved documentation:
         {rag_context or "(none)"}
 
+        Interpretation (may be imperfect):
+        {intent_text}
+
         Question: {question}
         """
     ).strip()
     return guidance
+
+
+def _normalize_identifier(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _needs_quoting(name: str) -> bool:
+    return re.fullmatch(r"[a-z_][a-z0-9_]*", name) is None
+
+
+def _normalized_column_maps(
+    manifest: list[TableManifest],
+) -> tuple[dict[str, dict[str, list[str]]], dict[str, list[str]]]:
+    by_table: dict[str, dict[str, list[str]]] = {}
+    global_map: dict[str, list[str]] = {}
+    for table in manifest:
+        table_map: dict[str, list[str]] = {}
+        for column in table.columns:
+            norm = _normalize_identifier(column)
+            table_map.setdefault(norm, [])
+            if column not in table_map[norm]:
+                table_map[norm].append(column)
+            global_map.setdefault(norm, [])
+            if column not in global_map[norm]:
+                global_map[norm].append(column)
+        by_table[table.name] = table_map
+    return by_table, global_map
+
+
+def _normalize_sql_columns(
+    sql_text: str, manifest: list[TableManifest], *, dialect: str
+) -> tuple[str, list[str]]:
+    warnings: list[str] = []
+    try:
+        statement = sqlglot.parse_one(sql_text, read=dialect)
+    except Exception:
+        return sql_text, warnings
+
+    lookup = _manifest_lookup(manifest)
+    table_maps, global_map = _normalized_column_maps(manifest)
+    alias_map: dict[str, TableManifest] = {}
+
+    for table in statement.find_all(exp.Table):
+        name = table.name
+        if not name:
+            continue
+        db = table.db
+        key = f"{db}.{name}".lower() if db else name.lower()
+        table_manifest = lookup.get(key) or lookup.get(name.lower())
+        if not table_manifest:
+            continue
+        alias = table.alias_or_name
+        if alias:
+            alias_map[alias.lower()] = table_manifest
+
+    for column in statement.find_all(exp.Column):
+        if column.name == "*":
+            continue
+        column_name = column.name
+        if not column_name:
+            continue
+        table_ref = (column.table or "").lower()
+        manifest_table: TableManifest | None = None
+        if table_ref:
+            manifest_table = alias_map.get(table_ref) or lookup.get(table_ref)
+        if manifest_table:
+            if column_name in manifest_table.columns:
+                continue
+            norm = _normalize_identifier(column_name)
+            candidates = table_maps.get(manifest_table.name, {}).get(norm, [])
+            if len(candidates) == 1:
+                canonical = candidates[0]
+                if canonical != column_name:
+                    column.set(
+                        "this",
+                        exp.Identifier(this=canonical, quoted=_needs_quoting(canonical)),
+                    )
+                    warnings.append(
+                        f'Normalized column {column_name} -> "{canonical}" in {manifest_table.name}'
+                    )
+            continue
+
+        norm = _normalize_identifier(column_name)
+        candidates = global_map.get(norm, [])
+        if len(candidates) == 1:
+            canonical = candidates[0]
+            if canonical != column_name:
+                column.set(
+                    "this",
+                    exp.Identifier(this=canonical, quoted=_needs_quoting(canonical)),
+                )
+                warnings.append(f'Normalized column {column_name} -> "{canonical}"')
+
+    try:
+        normalized = statement.sql(dialect=dialect)
+    except Exception:
+        return sql_text, warnings
+    return normalized, warnings
+
+
+def _quote_unquoted_columns(sql_text: str, manifest: list[TableManifest]) -> tuple[str, list[str]]:
+    warnings: list[str] = []
+    columns_to_quote: list[str] = []
+    for table in manifest:
+        for column in table.columns:
+            if _needs_quoting(column):
+                columns_to_quote.append(column)
+
+    if not columns_to_quote:
+        return sql_text, warnings
+
+    # Prefer longer names first to avoid partial replacements.
+    columns_to_quote = sorted(set(columns_to_quote), key=len, reverse=True)
+    updated = sql_text
+    for column in columns_to_quote:
+        quoted = f'"{column}"'
+        pattern = rf'(?<!")(?<![\\w]){re.escape(column)}(?![\\w])(?!")'
+        if re.search(pattern, updated):
+            updated = re.sub(pattern, quoted, updated)
+            warnings.append(f'Quoted column {column} -> "{column}"')
+    return updated, warnings
+
+
+def _repair_sql(
+    sql_text: str, manifest: list[TableManifest], *, dialect: str
+) -> tuple[str, list[str]]:
+    try:
+        sqlglot.parse_one(sql_text, read=dialect)
+        return sql_text, []
+    except Exception:
+        pass
+
+    repaired, warnings = _quote_unquoted_columns(sql_text, manifest)
+    if repaired == sql_text:
+        return sql_text, warnings
+    try:
+        sqlglot.parse_one(repaired, read=dialect)
+        return repaired, warnings
+    except Exception:
+        return repaired, warnings
 
 
 PROMPT_TEMPLATE = ChatPromptTemplate.from_messages(
@@ -335,6 +485,16 @@ PROMPT_TEMPLATE = ChatPromptTemplate.from_messages(
     ]
 )
 
+INTENT_PROMPT_TEMPLATE = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You interpret analytics questions. Return ONLY valid JSON with no extra text.",
+        ),
+        ("human", "{prompt}"),
+    ]
+)
+
 
 class NL2SQLState(TypedDict, total=False):
     question: str
@@ -343,6 +503,7 @@ class NL2SQLState(TypedDict, total=False):
     rag_context: str
     hits: list[dict[str, Any]]
     prompt: str
+    intent: dict[str, Any]
     raw_sql: str
     sql: str
     user_id: str
@@ -354,17 +515,159 @@ def _call_stub(manifest: list[TableManifest]) -> str:
     return f"SELECT * FROM {table} LIMIT 50;"
 
 
+def _intent_prompt(question: str, manifest: list[TableManifest]) -> str:
+    schema_text = _schema_block(manifest)
+    return textwrap.dedent(
+        f"""
+        You interpret a user's analytics question and return JSON only.
+        Use this schema to map column and table names exactly when possible.
+        Schema:
+        {schema_text}
+
+        Return JSON with:
+        - task: short verb like "duplicates", "count", "list", "aggregate", "trend", "unknown"
+        - columns: list of column names (use exact schema names if present)
+        - group_by: list of column names (optional)
+        - filters: list of simple filter phrases (optional)
+        - time_range: string or null (optional)
+        - output: short description of expected output
+        - notes: any short clarifying hint for SQL generation
+
+        Question: {question}
+        """
+    ).strip()
+
+
+def _extract_json_block(text: str) -> str | None:
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith("{") and text.endswith("}"):
+        return text
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return match.group(0)
+    return None
+
+
+def _normalize_intent_columns(
+    intent: dict[str, Any], manifest: list[TableManifest]
+) -> dict[str, Any]:
+    _, global_map = _normalized_column_maps(manifest)
+    updated = dict(intent)
+
+    def normalize_list(values: Any) -> list[str]:
+        if values is None:
+            return []
+        if isinstance(values, str):
+            values_list = [values]
+        elif isinstance(values, list):
+            values_list = [str(v) for v in values if v is not None]
+        else:
+            values_list = [str(values)]
+        out: list[str] = []
+        for item in values_list:
+            norm = _normalize_identifier(item)
+            candidates = global_map.get(norm, [])
+            if len(candidates) == 1:
+                out.append(candidates[0])
+            else:
+                out.append(item)
+        return out
+
+    for key in ("columns", "group_by"):
+        updated[key] = normalize_list(updated.get(key))
+    return updated
+
+
+def _interpret_stub(question: str, manifest: list[TableManifest]) -> dict[str, Any]:
+    lowered = question.lower()
+    task = "unknown"
+    if "duplicate" in lowered or "dup" in lowered:
+        task = "duplicates"
+    elif "count" in lowered:
+        task = "count"
+    elif "list" in lowered or "show" in lowered:
+        task = "list"
+    intent = {
+        "task": task,
+        "columns": [],
+        "group_by": [],
+        "filters": [],
+        "time_range": None,
+        "output": "",
+        "notes": "",
+    }
+    return _normalize_intent_columns(intent, manifest)
+
+
+def _interpret_question(question: str, manifest: list[TableManifest], model: Any) -> dict[str, Any]:
+    prompt = _intent_prompt(question, manifest)
+    parser = StrOutputParser()
+    chain = INTENT_PROMPT_TEMPLATE | model | parser
+    try:
+        raw = chain.invoke({"prompt": prompt}).strip()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "task": "unknown",
+            "columns": [],
+            "group_by": [],
+            "filters": [],
+            "time_range": None,
+            "output": "",
+            "notes": f"intent parse error: {exc}",
+        }
+
+    payload = _extract_json_block(raw)
+    if not payload:
+        return {
+            "task": "unknown",
+            "columns": [],
+            "group_by": [],
+            "filters": [],
+            "time_range": None,
+            "output": "",
+            "notes": "intent parse error: no JSON",
+        }
+
+    try:
+        parsed = json.loads(payload)
+    except Exception:  # noqa: BLE001
+        parsed = {}
+
+    if not isinstance(parsed, dict):
+        parsed = {"notes": "intent parse error: invalid JSON"}
+
+    return _normalize_intent_columns(parsed, manifest)
+
+
 @lru_cache(maxsize=4)
 def _compiled_graph(provider: str) -> Any:
     model = get_chat_model(provider)
     parser = StrOutputParser()
     graph = StateGraph(NL2SQLState)
 
+    if isinstance(model, StubChatModel):
+
+        def interpret_node(state: NL2SQLState) -> dict[str, Any]:
+            return {"intent": _interpret_stub(state["question"], state["manifest"])}
+
+    else:
+
+        def interpret_node(state: NL2SQLState) -> dict[str, Any]:
+            return {"intent": _interpret_question(state["question"], state["manifest"], model)}
+
     def prep_node(state: NL2SQLState) -> dict[str, Any]:
         k_value = cast(int, state.get("k", 4))
         user_id = state.get("user_id", "default")
         rag_context, hits = _rag_block(state["question"], k=k_value, user_id=user_id)
-        prompt = _prompt(state["question"], state["manifest"], state.get("recent", []), rag_context)
+        prompt = _prompt(
+            state["question"],
+            state["manifest"],
+            state.get("recent", []),
+            rag_context,
+            state.get("intent"),
+        )
         return {"rag_context": rag_context, "hits": hits, "prompt": prompt}
 
     if isinstance(model, StubChatModel):
@@ -385,10 +688,12 @@ def _compiled_graph(provider: str) -> Any:
     def clean_node(state: NL2SQLState) -> dict[str, Any]:
         return {"sql": _clean_sql(state.get("raw_sql", ""))}
 
+    graph.add_node("interpret", interpret_node)
     graph.add_node("prep", prep_node)
     graph.add_node("llm", llm_node)
     graph.add_node("clean", clean_node)
-    graph.set_entry_point("prep")
+    graph.set_entry_point("interpret")
+    graph.add_edge("interpret", "prep")
     graph.add_edge("prep", "llm")
     graph.add_edge("llm", "clean")
     graph.add_edge("clean", END)
@@ -538,11 +843,19 @@ def nl_to_sql(
     recent = _load_recent_questions(user_id=user_id)
     state = _run_graph(question, manifest, recent, user_id=user_id)
     prompt = state.get("prompt") or _prompt(
-        question, manifest, recent, state.get("rag_context", "")
+        question, manifest, recent, state.get("rag_context", ""), state.get("intent")
     )
     sql_text = state.get("sql") or _clean_sql(state.get("raw_sql", ""))
+    sql_text, repair_warnings = _repair_sql(sql_text, manifest, dialect=dialect)
+    sql_text, normalization_warnings = _normalize_sql_columns(sql_text, manifest, dialect=dialect)
     hits = state.get("hits", [])
     validation = validate_sql(sql_text, manifest, allow_writes=allow_writes, dialect=dialect)
+    if normalization_warnings or repair_warnings:
+        warnings = list(validation.get("warnings") or [])
+        for warning in repair_warnings + normalization_warnings:
+            if warning not in warnings:
+                warnings.append(warning)
+        validation["warnings"] = warnings
     explain_plan = explain_stub(sql_text, dialect) if explain and validation.get("ok") else None
 
     if validation.get("ok"):
@@ -552,6 +865,7 @@ def nl_to_sql(
         "sql": sql_text,
         "prompt": prompt,
         "manifest": [asdict(table) for table in manifest],
+        "intent": state.get("intent"),
         "validation": validation,
         "citations": {
             "tables": validation.get("tables", []),

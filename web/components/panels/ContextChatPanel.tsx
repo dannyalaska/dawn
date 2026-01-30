@@ -2,7 +2,7 @@
 
 import { FormEvent, useState, useRef, useEffect, useCallback } from 'react';
 import { PaperAirplaneIcon, CheckCircleIcon, CpuChipIcon } from '@heroicons/react/24/outline';
-import { addContextNote, chatRag, fetchMemory, generateSql, updateMemory } from '@/lib/api';
+import { DawnHttpError, addContextNote, chatRag, fetchMemory, generateSql, updateMemory } from '@/lib/api';
 import { useDawnSession } from '@/context/dawn-session';
 import type { RagMessage } from '@/lib/types';
 import clsx from 'clsx';
@@ -20,9 +20,56 @@ type DisplayMessage = {
   content: string;
   kind?: 'chat' | 'sql' | 'note';
   title?: string;
+  sqlText?: string;
+  sqlDetails?: string;
+  sqlVisible?: boolean;
+  sqlValidation?: 'Validated' | 'Needs review' | 'Unavailable';
 };
 
 const buildMessageId = () => `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+const normalizeSnippet = (text: string, maxLength = 220) => {
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  if (collapsed.length <= maxLength) return collapsed;
+  return `${collapsed.slice(0, Math.max(0, maxLength - 3))}...`;
+};
+
+const formatContextBlock = (
+  question: string,
+  recentQuestions: string[] | undefined,
+  contextHits: Array<{
+    text?: string;
+    source?: string | null;
+    row_index?: number;
+  }> | undefined
+) => {
+  const sections: string[] = [];
+  if (question) {
+    sections.push(`Question:\n${question}`);
+  }
+  if (recentQuestions && recentQuestions.length > 0) {
+    const recent = recentQuestions.slice(0, 3).map((q) => `- ${q}`).join('\n');
+    sections.push(`Recent questions:\n${recent}`);
+  }
+  if (contextHits && contextHits.length > 0) {
+    const snippetLines = contextHits.slice(0, 2).map((hit, idx) => {
+      const sourceText = typeof hit.source === 'string' ? hit.source.trim() : '';
+      const source = sourceText || 'context';
+      const row = typeof hit.row_index === 'number' ? hit.row_index : '?';
+      const text = hit.text ? normalizeSnippet(hit.text) : '';
+      if (!text) {
+        return `[${idx + 1}] source=${source} row=${row}`;
+      }
+      return `[${idx + 1}] source=${source} row=${row}\n${text}`;
+    });
+    sections.push(`Retrieved context:\n${snippetLines.join('\n\n')}`);
+  }
+
+  if (sections.length === 0) {
+    return 'Context used:\n(none)';
+  }
+  return `Context used:\n${sections.join('\n\n')}`;
+};
 
 const extractContextHint = (text: string) => {
   const columnMatch = text.match(
@@ -154,7 +201,12 @@ export default function ContextChatPanel({ disabled, source, activeFeedId, memor
         { token, apiBase }
       )
         .then((result) => {
-          const sqlBlock = result.sql ? `\n${result.sql.trim()}` : 'No SQL generated.';
+          const contextBlock = formatContextBlock(
+            trimmed,
+            result.recent_questions,
+            result.citations?.context
+          );
+          const sqlText = result.sql ? result.sql.trim() : '';
           const warnings = result.validation?.warnings?.length
             ? `\nWarnings: ${result.validation.warnings.join(' · ')}`
             : '';
@@ -162,30 +214,80 @@ export default function ContextChatPanel({ disabled, source, activeFeedId, memor
             ? `\nErrors: ${result.validation.errors.join(' · ')}`
             : '';
           const validationLabel = result.validation?.ok ? 'Validated' : 'Needs review';
+          const sqlDetails = `${contextBlock}${warnings}${errors}`.trim();
           setMessages((prev) =>
             prev.map((msg) =>
               msg.id === sqlMessageId
                 ? {
                     ...msg,
                     title: `NL → SQL agent · ${validationLabel}`,
-                    content: `${sqlBlock}${warnings}${errors}`.trim()
+                    content: sqlDetails,
+                    sqlText,
+                    sqlDetails,
+                    sqlVisible: false,
+                    sqlValidation: validationLabel
                   }
                 : msg
             )
           );
+          window.dispatchEvent(
+            new CustomEvent('nl2sql:result', {
+              detail: {
+                question: trimmed,
+                sql: sqlText,
+                details: sqlDetails,
+                validation: result.validation
+              }
+            })
+          );
         })
         .catch((err) => {
+          let detailMessage = '';
+          let detailSql = '';
+          let validationLabel: 'Validated' | 'Needs review' | 'Unavailable' = 'Unavailable';
+          if (err instanceof DawnHttpError && err.details && typeof err.details === 'object') {
+            const detailPayload = (err.details as Record<string, unknown>).detail;
+            if (detailPayload && typeof detailPayload === 'object') {
+              const payload = detailPayload as Record<string, any>;
+              detailSql = payload.sql ? String(payload.sql).trim() : '';
+              const errors = payload.validation?.errors?.length
+                ? `\nErrors: ${payload.validation.errors.join(' · ')}`
+                : '';
+              const warnings = payload.validation?.warnings?.length
+                ? `\nWarnings: ${payload.validation.warnings.join(' · ')}`
+                : '';
+              detailMessage = `${warnings}${errors}`.trim();
+              validationLabel = payload.validation?.ok ? 'Validated' : 'Needs review';
+            }
+          }
           setMessages((prev) =>
             prev.map((msg) =>
               msg.id === sqlMessageId
                 ? {
                     ...msg,
-                    title: 'NL → SQL agent · unavailable',
-                    content: err instanceof Error ? err.message : 'Unable to generate SQL.'
+                    title: `NL → SQL agent · ${validationLabel}`,
+                    content:
+                      detailMessage || (err instanceof Error ? err.message : 'Unable to generate SQL.'),
+                    sqlText: detailSql,
+                    sqlDetails: detailMessage,
+                    sqlVisible: false,
+                    sqlValidation: validationLabel
                   }
                 : msg
             )
           );
+          if (detailSql || detailMessage) {
+            window.dispatchEvent(
+              new CustomEvent('nl2sql:result', {
+                detail: {
+                  question: trimmed,
+                  sql: detailSql,
+                  details: detailMessage,
+                  validation: err instanceof DawnHttpError ? err.details : undefined
+                }
+              })
+            );
+          }
         });
     }
     try {
@@ -323,7 +425,35 @@ export default function ContextChatPanel({ disabled, source, activeFeedId, memor
                   </div>
                 )}
                 {isSql ? (
-                  <pre className="whitespace-pre-wrap break-words text-xs text-emerald-100">{msg.content}</pre>
+                  <div className="space-y-3">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setMessages((prev) =>
+                          prev.map((item) =>
+                            item.id === msg.id
+                              ? { ...item, sqlVisible: !item.sqlVisible }
+                              : item
+                          )
+                        )
+                      }
+                      className="rounded-full border border-emerald-300/30 px-3 py-1 text-[11px] uppercase tracking-[0.3em] text-emerald-200"
+                    >
+                      {msg.sqlVisible ? 'Hide SQL' : 'Show SQL'}
+                    </button>
+                    {msg.sqlVisible && msg.sqlText ? (
+                      <pre className="whitespace-pre-wrap break-words text-xs text-emerald-100">{msg.sqlText}</pre>
+                    ) : (
+                      <p className="text-xs text-emerald-200/80">
+                        SQL hidden. Click “Show SQL” to view.
+                      </p>
+                    )}
+                    {msg.sqlDetails && (
+                      <pre className="whitespace-pre-wrap break-words text-[11px] text-emerald-100/80">
+                        {msg.sqlDetails}
+                      </pre>
+                    )}
+                  </div>
                 ) : (
                   msg.content
                 )}

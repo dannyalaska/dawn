@@ -41,5 +41,8 @@ class Settings(BaseSettings):
     # Auth
     AUTH_REQUIRED: bool = False
 
+    # Dangerous operations
+    ALLOW_RESET: bool = False
+
 
 settings = Settings()

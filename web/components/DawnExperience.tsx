@@ -59,6 +59,20 @@ export default function DawnExperience() {
   }, []);
 
   useEffect(() => {
+    const handleReset = () => {
+      setSource(null);
+      setPreview(null);
+      setProfile(null);
+      setActiveFeed(null);
+      setLastUploadFile(null);
+      setAgentResult(null);
+      setActivities([]);
+    };
+    window.addEventListener('workspace:reset', handleReset);
+    return () => window.removeEventListener('workspace:reset', handleReset);
+  }, []);
+
+  useEffect(() => {
     const handleFocusTile = (event: Event) => {
       const customEvent = event as CustomEvent;
       const tileId = customEvent.detail?.tileId ?? null;

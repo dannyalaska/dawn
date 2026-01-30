@@ -15,7 +15,8 @@ import type {
   RagMessage,
   JobRecord,
   LMStudioModelsResponse,
-  NL2SQLResponse
+  NL2SQLResponse,
+  ResetWorkspaceResponse
 } from '@/lib/types';
 
 export class DawnHttpError extends Error {
@@ -101,6 +102,14 @@ export async function register(payload: { email: string; password: string; full_
 
 export async function fetchHealth(opts?: DawnRequestOptions) {
   return dawnRequest<ServiceHealth>('/health', opts);
+}
+
+export async function resetWorkspace(payload: { confirm: boolean }, opts?: DawnRequestOptions) {
+  return dawnRequest<ResetWorkspaceResponse>('/admin/reset', {
+    method: 'POST',
+    json: payload,
+    ...(opts || {})
+  });
 }
 
 export async function fetchFeeds(opts?: DawnRequestOptions) {

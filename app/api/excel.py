@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 file_param = File(...)
 
 
+# keep endpoints thin, offload heavy work to core modules, handle errors cleanly, and persist upload metadata asynchronously
 @router.post("/preview")
 async def preview(
     sheet: str | None = Query(default=None),

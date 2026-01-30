@@ -49,6 +49,7 @@ class BackendConn(TypedDict):
     config: dict[str, Any]
 
 
+# Defines all state fields used in the multi-agent workflow
 class AgentState(TypedDict, total=False):
     goal: str
     user_id: str
@@ -228,6 +229,8 @@ def _load_backend_sources(user_id: str) -> list[dict[str, Any]]:
     return sources
 
 
+# Converts summary metadata into a bounded plan of analysis tasks
+# these are derived from the dataset summary, augmented with backend schema info
 def _derive_plan(
     summary: dict[str, Any],
     *,

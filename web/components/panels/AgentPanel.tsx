@@ -94,6 +94,7 @@ export default function AgentPanel({ activeFeedId, uploadFile, uploadSheet, onFe
       if (uploadSheet) {
         form.append('sheet', uploadSheet);
       }
+      form.append('confirm_update', 'true');
       form.append('file', uploadFile);
       await ingestFeed(form, { token, apiBase });
       mutate(['feeds', token, apiBase], undefined, { revalidate: true }).catch(() => undefined);
@@ -196,7 +197,14 @@ export default function AgentPanel({ activeFeedId, uploadFile, uploadSheet, onFe
               demoSelectActive ? 'ring-2 ring-amber-400/40' : ''
             }`}
             value={selected}
-            onChange={(event) => setSelected(event.target.value)}
+            onChange={(event) => {
+              const next = event.target.value;
+              setSelected(next);
+              const match = feedList.find((feed) => feed.identifier === next);
+              if (match) {
+                onFeedReady?.(match);
+              }
+            }}
           >
             <option value="">Choose a feed…</option>
             {feedList.map((feed) => (

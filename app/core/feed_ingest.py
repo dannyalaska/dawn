@@ -32,6 +32,12 @@ class FeedIngestError(Exception):
     """Raised when feed ingestion cannot proceed."""
 
 
+class FeedIngestConflict(FeedIngestError):
+    def __init__(self, message: str, payload: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.payload = payload or {"message": message}
+
+
 FEED_SOURCE_KINDS = {"upload", "s3", "http"}
 DATA_FORMATS = {"excel", "csv"}
 MAX_DATASET_ROWS = int(os.getenv("DAWN_MAX_DATASET_ROWS", "200000"))
@@ -648,6 +654,7 @@ def ingest_feed(
     s3_path: str | None,
     http_url: str | None,
     user_id: int,
+    confirm_update: bool = False,
 ) -> dict[str, Any]:
     kind = _ensure_kind(source_kind)
     inferred_format = _infer_format(filename, data_format)
@@ -803,6 +810,22 @@ def ingest_feed(
         )
 
         previous_version = latest_version
+
+        if latest_version and latest_version.sha16 != digest and not confirm_update:
+            raise FeedIngestConflict(
+                f"Feed '{identifier}' already exists with different content.",
+                payload={
+                    "code": "feed_update_required",
+                    "message": (
+                        "This upload differs from the latest feed version. "
+                        "Re-submit with confirm_update=true to create a new version."
+                    ),
+                    "identifier": identifier,
+                    "current_version": latest_version.version,
+                    "current_sha16": latest_version.sha16,
+                    "incoming_sha16": digest,
+                },
+            )
 
         if latest_version and latest_version.sha16 == digest:
             feed_version = latest_version

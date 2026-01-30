@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from app.core.auth import CurrentUser
 from app.core.db import session_scope
-from app.core.feed_ingest import FeedIngestError, ingest_feed
+from app.core.feed_ingest import FeedIngestConflict, FeedIngestError, ingest_feed
 from app.core.limits import SizeLimitError, read_upload_bytes
 from app.core.models import Feed, FeedVersion
 
@@ -30,6 +30,7 @@ async def feed_ingest(
     sheet: str | None = Form(default=None),
     s3_path: str | None = Form(default=None),
     http_url: str | None = Form(default=None),
+    confirm_update: bool = Form(default=False),
     file: UploadFile | None = upload_file_param,
     *,
     current_user: CurrentUser,
@@ -57,7 +58,10 @@ async def feed_ingest(
             s3_path=s3_path,
             http_url=http_url,
             user_id=current_user.id,
+            confirm_update=confirm_update,
         )
+    except FeedIngestConflict as exc:
+        raise HTTPException(409, exc.payload) from exc
     except FeedIngestError as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

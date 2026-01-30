@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { CloudIcon } from '@heroicons/react/24/outline';
-import { ingestFeed } from '@/lib/api';
+import { DawnHttpError, ingestFeed } from '@/lib/api';
 import { useDawnSession } from '@/context/dawn-session';
 import { useSWRConfig } from 'swr';
 import type { FeedRecord } from '@/lib/types';
@@ -34,6 +34,10 @@ export default function FeedIngestPanel({
   const [fileSource, setFileSource] = useState<'latest' | 'manual' | null>(null);
   const [status, setStatus] = useState('Add a feed to enable autonomous analysis.');
   const [pending, setPending] = useState(false);
+  const [confirmInfo, setConfirmInfo] = useState<{
+    message: string;
+    currentVersion?: number;
+  } | null>(null);
 
   const suggestedMeta = useMemo(() => suggestFeedMeta(defaultFile?.name, defaultSheet), [defaultFile, defaultSheet]);
 
@@ -53,14 +57,14 @@ export default function FeedIngestPanel({
     }
   }, [defaultFile, defaultSheet, file, fileSource, identifier, name, sheet, suggestedMeta]);
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function submitFeed(confirmUpdate: boolean) {
     if (!file) {
       setStatus('Please attach a workbook.');
       return;
     }
     setPending(true);
-    setStatus('Ingesting feed…');
+    setConfirmInfo(null);
+    setStatus(confirmUpdate ? 'Confirming new feed version…' : 'Ingesting feed…');
     try {
       const form = new FormData();
       form.append('identifier', identifier.trim());
@@ -68,6 +72,9 @@ export default function FeedIngestPanel({
       form.append('source_type', 'upload');
       if (sheet) {
         form.append('sheet', sheet.trim());
+      }
+      if (confirmUpdate) {
+        form.append('confirm_update', 'true');
       }
       form.append('file', file);
       const response = await ingestFeed(form, { token, apiBase });
@@ -79,10 +86,40 @@ export default function FeedIngestPanel({
         source_type: response?.feed?.source_type || 'upload'
       });
     } catch (err) {
-      setStatus(err instanceof Error ? err.message : 'Feed ingest failed');
+      if (err instanceof DawnHttpError && err.status === 409) {
+        const detailPayload =
+          err.details &&
+          typeof err.details === 'object' &&
+          'detail' in (err.details as Record<string, unknown>)
+            ? (err.details as Record<string, unknown>).detail
+            : null;
+        const detailObject =
+          detailPayload && typeof detailPayload === 'object'
+            ? (detailPayload as Record<string, unknown>)
+            : null;
+        const message =
+          (detailObject && typeof detailObject.message === 'string' && detailObject.message) ||
+          err.message ||
+          'This upload differs from the latest feed version. Confirm to continue.';
+        setConfirmInfo({
+          message,
+          currentVersion:
+            detailObject && typeof detailObject.current_version === 'number'
+              ? detailObject.current_version
+              : undefined
+        });
+        setStatus(message);
+      } else {
+        setStatus(err instanceof Error ? err.message : 'Feed ingest failed');
+      }
     } finally {
       setPending(false);
     }
+  }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await submitFeed(false);
   }
 
   const availableSheets = sheetOptions.length ? sheetOptions : defaultSheet ? [defaultSheet] : [];
@@ -207,6 +244,24 @@ export default function FeedIngestPanel({
           {pending ? 'Registering…' : 'Register feed'}
         </button>
       </form>
+      {confirmInfo && (
+        <div className="mt-4 rounded-2xl border border-amber-400/30 bg-amber-500/10 p-4 text-xs text-amber-100">
+          <p className="uppercase tracking-[0.3em] text-amber-200">Confirm new version</p>
+          <p className="mt-2 text-sm text-amber-50">
+            {confirmInfo.currentVersion !== undefined
+              ? `Latest version is v${confirmInfo.currentVersion}. ${confirmInfo.message}`
+              : confirmInfo.message}
+          </p>
+          <button
+            type="button"
+            onClick={() => void submitFeed(true)}
+            disabled={pending}
+            className="mt-3 inline-flex items-center gap-2 rounded-full border border-amber-400/40 px-3 py-1 text-[11px] uppercase tracking-[0.3em] text-amber-200 disabled:opacity-50"
+          >
+            Create new version
+          </button>
+        </div>
+      )}
       <p className="mt-3 text-xs text-slate-400">{status}</p>
     </div>
   );

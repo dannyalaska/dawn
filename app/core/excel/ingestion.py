@@ -31,6 +31,7 @@ def cache_key(content: bytes, sheet: str | None, user_id: str = "default") -> st
     return f"dawn:dev:preview:{user_id}:{h}{suffix}"
 
 
+# Sanitize individual scalar values for JSON serialization
 def _sanitize_scalar(x: Any) -> Any:
     # NaNs/NaT → None
     if x is None:
@@ -78,6 +79,8 @@ def df_profile(df: pd.DataFrame) -> list[dict[str, Any]]:
     return cols
 
 
+# Create a lightweight textual + structured summary for the dataframe
+# read, profile, and cache previews of Excel sheets
 def preview_from_bytes(
     content: bytes,
     sheet_name: str | None = None,

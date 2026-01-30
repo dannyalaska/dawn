@@ -196,6 +196,18 @@ export interface RagChatResponse {
   direct_answer?: boolean;
 }
 
+export interface NL2SQLContextHit {
+  id?: string;
+  key?: string;
+  text?: string;
+  source?: string | null;
+  row_index?: number;
+  type?: string;
+  tags?: string[];
+  column_name?: string | null;
+  score?: number;
+}
+
 export interface NL2SQLResponse {
   sql: string;
   validation: {
@@ -205,12 +217,21 @@ export interface NL2SQLResponse {
     tables?: string[];
     columns?: string[];
   };
+  intent?: Record<string, unknown>;
   citations?: {
     tables?: string[];
     columns?: string[];
-    context?: Array<Record<string, unknown>>;
+    context?: NL2SQLContextHit[];
   };
   explain?: string | null;
+  recent_questions?: string[];
+}
+
+export interface ResetWorkspaceResponse {
+  ok: boolean;
+  deleted: Record<string, number>;
+  dropped_tables: number;
+  redis_deleted: Record<string, number>;
 }
 
 export interface LMStudioModel {

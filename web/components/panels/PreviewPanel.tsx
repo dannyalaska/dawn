@@ -8,9 +8,18 @@ interface PreviewPanelProps {
   preview: PreviewTable | null;
 }
 
+type SqlPreview = {
+  question: string;
+  sql: string;
+  details?: string;
+  validation?: { ok?: boolean; errors?: string[]; warnings?: string[] };
+  receivedAt: string;
+};
+
 export default function PreviewPanel({ preview }: PreviewPanelProps) {
   const [demoScanning, setDemoScanning] = useState(false);
   const [scanRow, setScanRow] = useState(0);
+  const [sqlPreview, setSqlPreview] = useState<SqlPreview | null>(null);
 
   useEffect(() => {
     const handleDemoPreview = () => {
@@ -19,6 +28,23 @@ export default function PreviewPanel({ preview }: PreviewPanelProps) {
     };
     window.addEventListener('demo:preview-file', handleDemoPreview);
     return () => window.removeEventListener('demo:preview-file', handleDemoPreview);
+  }, []);
+
+  useEffect(() => {
+    const handleSqlPreview = (event: Event) => {
+      const customEvent = event as CustomEvent;
+      const detail = customEvent.detail ?? {};
+      if (!detail || typeof detail !== 'object') return;
+      setSqlPreview({
+        question: String(detail.question || ''),
+        sql: String(detail.sql || ''),
+        details: detail.details ? String(detail.details) : undefined,
+        validation: detail.validation?.validation ?? detail.validation?.detail?.validation ?? detail.validation,
+        receivedAt: new Date().toISOString()
+      });
+    };
+    window.addEventListener('nl2sql:result', handleSqlPreview);
+    return () => window.removeEventListener('nl2sql:result', handleSqlPreview);
   }, []);
 
   useEffect(() => {
@@ -35,7 +61,7 @@ export default function PreviewPanel({ preview }: PreviewPanelProps) {
     };
   }, [demoScanning]);
 
-  if (!preview) {
+  if (!preview && !sqlPreview) {
     return (
       <div className="rounded-3xl border border-dashed border-white/15 p-6 text-sm text-slate-400">
         Preview a workbook to inspect sample rows before indexing.
@@ -43,20 +69,51 @@ export default function PreviewPanel({ preview }: PreviewPanelProps) {
     );
   }
 
-  const sampleRows = preview.rows.slice(0, 8);
-  const columns = preview.columns.map((c) => c.name);
+  const sampleRows = preview?.rows.slice(0, 8) ?? [];
+  const columns = preview?.columns.map((c) => c.name) ?? [];
   const activeRow = demoScanning ? scanRow % Math.max(sampleRows.length, 1) : -1;
 
   return (
     <div className="overflow-hidden rounded-3xl border border-white/10 bg-white/5">
+      {sqlPreview && (
+        <div className="border-b border-white/10 px-6 py-4">
+          <p className="text-xs uppercase tracking-[0.4em] text-emerald-300">SQL preview</p>
+          <div className="mt-3 rounded-2xl border border-emerald-400/30 bg-emerald-500/5 p-4 text-xs text-emerald-100">
+            {sqlPreview.question && (
+              <p className="mb-2 text-[11px] uppercase tracking-[0.3em] text-emerald-300">
+                {sqlPreview.question}
+              </p>
+            )}
+            {sqlPreview.sql ? (
+              <pre className="whitespace-pre-wrap break-words">{sqlPreview.sql}</pre>
+            ) : (
+              <p>No SQL generated.</p>
+            )}
+            {(sqlPreview.validation?.errors?.length || sqlPreview.validation?.warnings?.length) && (
+              <div className="mt-3 space-y-1 text-[11px] text-emerald-200/80">
+                {sqlPreview.validation?.warnings?.length ? (
+                  <p>Warnings: {sqlPreview.validation.warnings.join(' · ')}</p>
+                ) : null}
+                {sqlPreview.validation?.errors?.length ? (
+                  <p>Errors: {sqlPreview.validation.errors.join(' · ')}</p>
+                ) : null}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-6 py-4">
         <div>
           <p className="text-xs uppercase tracking-[0.4em] text-slate-400">Preview</p>
-          <h3 className="text-lg font-semibold text-white">
-            {preview.sheet} · {preview.shape[0].toLocaleString()} rows
-          </h3>
+          {preview ? (
+            <h3 className="text-lg font-semibold text-white">
+              {preview.sheet} · {preview.shape[0].toLocaleString()} rows
+            </h3>
+          ) : (
+            <h3 className="text-lg font-semibold text-white">No preview loaded</h3>
+          )}
         </div>
-        {preview.sheet_names?.length ? (
+        {preview?.sheet_names?.length ? (
           <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-300">
             {preview.sheet_names.length} sheets detected
           </span>
@@ -68,37 +125,44 @@ export default function PreviewPanel({ preview }: PreviewPanelProps) {
           Scanning columns and rows
         </div>
       )}
-      <div className="scroll-soft overflow-x-auto">
-        <table className="min-w-full divide-y divide-white/10 text-sm text-slate-200">
-          <thead>
-            <tr>
-              {columns.map((col) => (
-                <th key={col} className="bg-white/5 px-4 py-2 text-left text-xs uppercase tracking-[0.3em] text-slate-400">
-                  {col}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {sampleRows.map((row, idx) => (
-              <tr
-                key={idx}
-                className={clsx(
-                  'border-b border-white/5 transition-colors duration-300',
-                  idx % 2 === 0 ? 'bg-transparent' : 'bg-white/5',
-                  demoScanning && idx === activeRow ? 'bg-amber-400/10 ring-1 ring-amber-300/40' : ''
-                )}
-              >
+      {preview ? (
+        <div className="scroll-soft overflow-x-auto">
+          <table className="min-w-full divide-y divide-white/10 text-sm text-slate-200">
+            <thead>
+              <tr>
                 {columns.map((col) => (
-                  <td key={col} className="px-4 py-2 text-xs text-slate-100">
-                    {(row[col] ?? '').toString()}
-                  </td>
+                  <th
+                    key={col}
+                    className="bg-white/5 px-4 py-2 text-left text-xs uppercase tracking-[0.3em] text-slate-400"
+                  >
+                    {col}
+                  </th>
                 ))}
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody>
+              {sampleRows.map((row, idx) => (
+                <tr
+                  key={idx}
+                  className={clsx(
+                    'border-b border-white/5 transition-colors duration-300',
+                    idx % 2 === 0 ? 'bg-transparent' : 'bg-white/5',
+                    demoScanning && idx === activeRow ? 'bg-amber-400/10 ring-1 ring-amber-300/40' : ''
+                  )}
+                >
+                  {columns.map((col) => (
+                    <td key={col} className="px-4 py-2 text-xs text-slate-100">
+                      {(row[col] ?? '').toString()}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="p-6 text-sm text-slate-400">Preview a workbook to inspect sample rows.</div>
+      )}
     </div>
   );
 }
