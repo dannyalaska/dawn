@@ -1,10 +1,13 @@
 """
-DAWN demo recorder — narrated + captioned MP4 with zoom-in feature highlights.
+DAWN demo recorder — narrated + captioned MP4.
 
-Generates ElevenLabs voice-over (voice: Eric — smooth tenor), seeds demo data
-via the live backend API, then records the populated DAWN dashboard using
-headless Playwright. Key features are highlighted with animated zoom-in crops
-via PIL for a polished, dynamic look.
+Seeds demo data via the live backend API, then records the populated DAWN
+dashboard using headless Playwright. No zoom effects — just the real UI
+scrolling through each feature area with ElevenLabs voice-over.
+
+Demo data: docs/DAWN_Demo_Workbook.xlsx
+  • "Ticketing Data"  — 150 rows × 6 cols
+  • "Sales Revenue"   — 150 rows × 5 cols
 
 Usage:
     python record_demo.py
@@ -48,10 +51,9 @@ ELEVENLABS_MODEL = _dotenv.get("ELEVENLABS_MODEL_ID") or os.getenv(
 # ---------------------------------------------------------------------------
 FRONTEND_URL = "http://localhost:3000"
 BACKEND_URL = "http://localhost:8000"
-FPS = 3  # 3fps — smooth enough, keeps file size down
+FPS = 3
 OUTPUT_MP4 = Path(__file__).parent / "docs" / "demo_recording.mp4"
 VIEWPORT = {"width": 1440, "height": 900}
-W, H = VIEWPORT["width"], VIEWPORT["height"]
 
 # ---------------------------------------------------------------------------
 # Narration script: (start_second, caption_text, spoken_text)
@@ -65,33 +67,34 @@ NARRATION = [
     ),
     (
         9,
-        "One click loads demo data + runs full agent analysis",
-        "Hit Run Demo and Dawn ingests your dataset, profiles every column, and kicks off "
-        "a seven-agent analysis pipeline — automatically. No configuration required.",
+        "One click ingests real data and kicks off agent analysis",
+        "Hit Run Demo and Dawn ingests your spreadsheet — two real datasets, "
+        "ticketing and sales — profiles every column, and kicks off a full agent pipeline. "
+        "No configuration required.",
     ),
     (
         22,
-        "Data quality checks run on every ingest",
+        "Data quality checks run automatically on every ingest",
         "Every feed gets automatic data quality checks. Green means your data is clean. "
-        "Red means Dawn already found something worth investigating before you even asked.",
+        "Dawn flags issues before you even ask.",
     ),
     (
         33,
-        "Seven agents — planner, executor, memory, QA, and more",
-        "Dawn's agent swarm generates an action plan, executes analytical tasks, spots "
-        "anomalies, checks for drift, and writes a structured report — all without a single query.",
+        "Browse your feeds — live row counts, versions, DQ status",
+        "The feed gallery shows every connected dataset with live row counts, "
+        "version history, and data quality scores at a glance.",
     ),
     (
         44,
         "Runs on any LLM — local or cloud",
-        "Dawn runs on whatever LLM you choose. Fully local with Ollama or LM Studio for "
-        "air-gapped deployments, or cloud-powered with OpenAI or Claude. One toggle.",
+        "Dawn runs on whatever LLM you choose — fully local with Ollama or LM Studio "
+        "for air-gapped deployments, or cloud-powered with OpenAI or Claude. One toggle.",
     ),
     (
         54,
         "Ask in plain English — Dawn writes and runs the SQL",
-        "Teams can ask questions in plain English. Dawn translates them to SQL, runs them "
-        "read-only against your connected databases, and returns live results. Securely.",
+        "Teams ask questions in plain English. Dawn translates them to SQL, runs them "
+        "read-only against your connected data, and returns live results. Securely.",
     ),
     (
         63,
@@ -103,7 +106,7 @@ NARRATION = [
 
 
 # ---------------------------------------------------------------------------
-# PIL image helpers
+# PIL caption helpers
 # ---------------------------------------------------------------------------
 
 
@@ -147,9 +150,7 @@ def burn_caption(frame_bytes: bytes, caption: str) -> bytes:
 
     draw = ImageDraw.Draw(img)
     w, h = img.size
-    font_sz = max(22, w // 52)
-    font = load_font(font_sz)
-
+    font = load_font(max(22, w // 52))
     bbox = draw.textbbox((0, 0), caption, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
@@ -187,60 +188,6 @@ def add_dawn_watermark(frame_bytes: bytes) -> bytes:
     return out.getvalue()
 
 
-def _smoothstep(t: float) -> float:
-    t = max(0.0, min(1.0, t))
-    return t * t * (3 - 2 * t)
-
-
-def zoom_sequence(
-    frame_bytes: bytes,
-    target_box: tuple[int, int, int, int],
-    n_frames: int = 6,
-    reverse: bool = False,
-) -> list[bytes]:
-    """
-    Animate zoom from full viewport to target_box (or reversed if reverse=True).
-    Returns list of n_frames PNG bytes.
-    """
-    Image, _, _ = _pil()
-    x1t, y1t, x2t, y2t = target_box
-    img = Image.open(io.BytesIO(frame_bytes)).convert("RGB")
-
-    result_frames: list[bytes] = []
-    for i in range(n_frames):
-        raw_t = i / max(n_frames - 1, 1)
-        t = _smoothstep(raw_t if not reverse else 1.0 - raw_t)
-
-        cx1 = int(t * x1t)
-        cy1 = int(t * y1t)
-        cx2 = int(W + t * (x2t - W))
-        cy2 = int(H + t * (y2t - H))
-
-        if cx2 - cx1 < 10:
-            cx2 = cx1 + 10
-        if cy2 - cy1 < 10:
-            cy2 = cy1 + 10
-
-        cropped = img.crop((cx1, cy1, cx2, cy2))
-        zoomed = cropped.resize((W, H), Image.LANCZOS)
-        out = io.BytesIO()
-        zoomed.save(out, format="PNG")
-        result_frames.append(out.getvalue())
-
-    return result_frames
-
-
-def static_zoom(frame_bytes: bytes, box: tuple[int, int, int, int]) -> bytes:
-    """Return a single frame cropped to box and scaled back to viewport size."""
-    Image, _, _ = _pil()
-    img = Image.open(io.BytesIO(frame_bytes)).convert("RGB")
-    cropped = img.crop(box)
-    zoomed = cropped.resize((W, H), Image.LANCZOS)
-    out = io.BytesIO()
-    zoomed.save(out, format="PNG")
-    return out.getvalue()
-
-
 # ---------------------------------------------------------------------------
 # Voice-over generation
 # ---------------------------------------------------------------------------
@@ -261,14 +208,14 @@ def generate_vo(tmp_dir: Path) -> list[tuple[float, Path]]:
     clips: list[tuple[float, Path]] = []
     for i, (start_sec, _caption, spoken) in enumerate(NARRATION):
         preview = spoken[:60] + ("…" if len(spoken) > 60 else "")
-        print(f'  [vo] Segment {i+1}/{len(NARRATION)}: "{preview}"')
+        print(f'  [vo] Segment {i + 1}/{len(NARRATION)}: "{preview}"')
         payload = {
             "text": spoken,
             "model_id": ELEVENLABS_MODEL,
             "voice_settings": {
-                "stability": 0.42,
-                "similarity_boost": 0.78,
-                "style": 0.35,
+                "stability": 0.40,
+                "similarity_boost": 0.80,
+                "style": 0.30,
                 "use_speaker_boost": True,
             },
         }
@@ -280,7 +227,7 @@ def generate_vo(tmp_dir: Path) -> list[tuple[float, Path]]:
             print(f"           → {len(resp.content) // 1024} KB")
             clips.append((float(start_sec), out_path))
         except Exception as exc:
-            print(f"  [vo] FAILED segment {i+1}: {exc}")
+            print(f"  [vo] FAILED segment {i + 1}: {exc}")
 
     return clips
 
@@ -304,18 +251,27 @@ def wait_for_url(url: str, label: str, timeout: int = 30) -> bool:
 
 
 def seed_demo_via_api() -> bool:
+    """
+    POST /demo/seed before browser opens so feeds are in the DB.
+    Returns True if at least one feed was ingested or already exists.
+    """
     print("[setup] Seeding demo workspace via API …", end=" ", flush=True)
     try:
         resp = _req.post(f"{BACKEND_URL}/demo/seed", timeout=60)
         if resp.status_code in (200, 201):
             data = resp.json()
             feeds = data.get("feeds", [])
+            errors = data.get("errors", [])
             print(f"✓  ({len(feeds)} feeds)")
             for f in feeds:
                 print(
-                    f"    • {f.get('identifier')} — {f.get('status')} ({f.get('rows', '?')} rows)"
+                    f"    • {f.get('identifier')}  [{f.get('status')}]"
+                    f"  {f.get('rows', '?')} rows"
                 )
-            return True
+            if errors:
+                for e in errors:
+                    print(f"    ⚠  {e}")
+            return bool(feeds)
         print(f"✗ HTTP {resp.status_code}: {resp.text[:200]}")
         return False
     except Exception as exc:
@@ -324,13 +280,11 @@ def seed_demo_via_api() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Recorder — frame accumulator with animated zoom support
+# Recorder — plain screenshot accumulator, no zoom
 # ---------------------------------------------------------------------------
 
 
 class Recorder:
-    """Headless Playwright recorder with PIL-based animated zoom highlights."""
-
     def __init__(self, page, fps: int = FPS):
         self.page = page
         self.fps = fps
@@ -342,34 +296,25 @@ class Recorder:
     def t(self) -> float:
         return self._t
 
-    # ------------------------------------------------------------------
-    # Core capture
-    # ------------------------------------------------------------------
-
-    def _add_frame(self, raw: bytes) -> None:
-        caption = caption_for_time(self._t)
-        self.frames.append(add_dawn_watermark(burn_caption(raw, caption)))
-        self._t += self.interval
-
-    def snap(self, n: int = 1) -> bytes:
-        """Capture n frames of the current viewport. Returns raw PNG of last shot."""
+    def snap(self, n: int = 1) -> None:
         raw = self.page.screenshot(full_page=False)
+        caption = caption_for_time(self._t)
+        frame = add_dawn_watermark(burn_caption(raw, caption))
         for _ in range(n):
-            self._add_frame(raw)
+            self.frames.append(frame)
+            self._t += self.interval
             time.sleep(self.interval)
-        return raw
 
-    def wait_and_snap(self, seconds: float) -> bytes:
-        return self.snap(max(1, round(seconds * self.fps)))
+    def wait_and_snap(self, seconds: float) -> None:
+        """Hold current view for `seconds`, capturing at FPS."""
+        end = self._t + seconds
+        while self._t < end:
+            self.snap(1)
 
-    # ------------------------------------------------------------------
-    # Navigation
-    # ------------------------------------------------------------------
-
-    def scroll_to(self, y: int = 0, smooth: bool = True) -> None:
+    def scroll_to(self, y: int, smooth: bool = True) -> None:
         behavior = "smooth" if smooth else "auto"
         self.page.evaluate(f"window.scrollTo({{top: {y}, behavior: '{behavior}'}})")
-        time.sleep(0.35)
+        time.sleep(0.4)
 
     def try_click(self, selector: str, timeout: int = 2000) -> bool:
         try:
@@ -394,112 +339,20 @@ class Recorder:
             pass
         return False
 
-    # ------------------------------------------------------------------
-    # Element bounding box
-    # ------------------------------------------------------------------
-
-    def element_box(
-        self,
-        selector: str,
-        padding: int = 80,
-        min_w_frac: float = 0.35,
-        min_h_frac: float = 0.30,
-    ) -> tuple[int, int, int, int] | None:
-        """Viewport-clamped box around an element, expanded to minimum fractions."""
-        try:
-            el = self.page.locator(selector).first
-            b = el.bounding_box()
-            if not b:
-                return None
-            x1 = max(0, int(b["x"]) - padding)
-            y1 = max(0, int(b["y"]) - padding)
-            x2 = min(W, int(b["x"] + b["width"]) + padding)
-            y2 = min(H, int(b["y"] + b["height"]) + padding)
-            min_bw = int(W * min_w_frac)
-            min_bh = int(H * min_h_frac)
-            while (x2 - x1) < min_bw:
-                x1 = max(0, x1 - 30)
-                x2 = min(W, x2 + 30)
-            while (y2 - y1) < min_bh:
-                y1 = max(0, y1 - 30)
-                y2 = min(H, y2 + 30)
-            return (x1, y1, x2, y2)
-        except Exception:
-            return None
-
-    # ------------------------------------------------------------------
-    # Zoom shots
-    # ------------------------------------------------------------------
-
-    def zoom_in_to(
-        self,
-        box: tuple[int, int, int, int],
-        hold_seconds: float = 3.0,
-        n_zoom_frames: int = 5,
-    ) -> bytes:
-        """
-        Snapshot current state, animate zoom into box, hold at full zoom.
-        Returns the raw screenshot taken before zoom (for zoom-out later).
-        """
-        raw = self.page.screenshot(full_page=False)
-
-        for fr in zoom_sequence(raw, box, n_frames=n_zoom_frames):
-            self._add_frame(fr)
-            time.sleep(self.interval)
-
-        hold_frame = static_zoom(raw, box)
-        for _ in range(max(1, round(hold_seconds * self.fps))):
-            self._add_frame(hold_frame)
-            time.sleep(self.interval)
-
-        return raw
-
-    def zoom_out_from(
-        self,
-        raw_before_zoom: bytes,
-        box: tuple[int, int, int, int],
-        n_zoom_frames: int = 5,
-    ) -> None:
-        """Animate zoom out from box back to full viewport."""
-        for fr in zoom_sequence(raw_before_zoom, box, n_frames=n_zoom_frames, reverse=True):
-            self._add_frame(fr)
-            time.sleep(self.interval)
-
-    def snap_current_zoomed(
-        self,
-        box: tuple[int, int, int, int],
-        hold_seconds: float = 3.0,
-        n_zoom_frames: int = 5,
-    ) -> bytes:
-        """
-        Take a fresh screenshot, zoom in to box on that shot, hold.
-        Use this when content has changed (e.g., after clicking Run Demo).
-        """
-        raw = self.page.screenshot(full_page=False)
-        for fr in zoom_sequence(raw, box, n_frames=n_zoom_frames):
-            self._add_frame(fr)
-            time.sleep(self.interval)
-        hold_frame = static_zoom(raw, box)
-        for _ in range(max(1, round(hold_seconds * self.fps))):
-            self._add_frame(hold_frame)
-            time.sleep(self.interval)
-        return raw
-
 
 # ---------------------------------------------------------------------------
-# Choreography
+# Choreography — straight shots, no zoom
 # ---------------------------------------------------------------------------
 
 
-def _click_tile(page, tile_id: str) -> bool:
-    """Click the expand button on a DAWN tile by its data-demo-target id."""
+def _expand_tile(page, tile_id: str) -> bool:
+    """Click the expand button on a DAWN tile by its data-demo-target."""
     try:
         tile = page.locator(f"[data-demo-target='{tile_id}']").first
-        if tile.count() == 0:
+        if not tile.count():
             return False
         tile.scroll_into_view_if_needed(timeout=2000)
         time.sleep(0.2)
-        # Try the expand/collapse button inside the tile header
         btn = tile.locator("button").first
         if btn.is_visible(timeout=1000):
             btn.click()
@@ -514,185 +367,77 @@ def record_choreography(page) -> list[bytes]:
     r = Recorder(page, fps=FPS)
 
     # -----------------------------------------------------------------------
-    # SCENE 1 (0–9s) — Establishing wide shot of the dashboard
+    # SCENE 1 (0–9s) — Dashboard overview, sidebar visible
     # -----------------------------------------------------------------------
-    print("  [scene 1] Establishing wide shot …")
+    print("  [scene 1] Dashboard overview …")
     r.scroll_to(0)
     time.sleep(1.0)
     r.wait_and_snap(9)
 
     # -----------------------------------------------------------------------
-    # SCENE 2 (9–22s) — Zoom to Run Demo button → click → watch seeding feedback
+    # SCENE 2 (9–22s) — Click Run Demo, watch seeding feedback
+    # Ingests DAWN_Demo_Workbook.xlsx: "Ticketing Data" + "Sales Revenue" sheets
     # -----------------------------------------------------------------------
-    print("  [scene 2] Zoom → Run Demo …")
+    print("  [scene 2] Run Demo …")
     r.scroll_to(0)
     time.sleep(0.3)
-
-    btn_box = r.element_box(
-        "button:has-text('Run Demo')",
-        padding=60,
-        min_w_frac=0.22,
-        min_h_frac=0.16,
-    )
-
-    if btn_box:
-        r.zoom_in_to(btn_box, hold_seconds=1.2, n_zoom_frames=6)
-        clicked = r.try_click("button:has-text('Run Demo')", timeout=3000)
-        print(f"    → clicked Run Demo: {clicked}")
-        time.sleep(0.8)
-        # Fresh shot showing "Seeding workspace…" feedback, still zoomed
-        r.snap_current_zoomed(btn_box, hold_seconds=5.5, n_zoom_frames=3)
-        raw_after = r.page.screenshot(full_page=False)
-        r.zoom_out_from(raw_after, btn_box, n_zoom_frames=5)
-    else:
-        print("    → button box not found, fallback")
-        r.try_click("button:has-text('Run Demo')", timeout=3000)
-        r.wait_and_snap(13)
+    clicked = r.try_click("button:has-text('Run Demo')", timeout=3000)
+    print(f"    → clicked: {clicked}")
+    r.wait_and_snap(13)  # show "Seeding workspace…" → "✓ Seeded N feeds" feedback
 
     # -----------------------------------------------------------------------
-    # SCENE 3 (22–33s) — Feed gallery cards + DQ badges
-    #   The feedGallery tile must be expanded first.
+    # SCENE 3 (22–33s) — Feed gallery with real cards + DQ badges
     # -----------------------------------------------------------------------
-    print("  [scene 3] Zoom → feed gallery …")
-    time.sleep(0.5)
+    print("  [scene 3] Feed gallery …")
+    expanded = _expand_tile(page, "feedGallery")
+    print(f"    → feedGallery tile expanded: {expanded}")
+    time.sleep(2.5)  # wait for SWR fetch after tile mounts
 
-    # Expand the feedGallery tile so FeedGallery component renders
-    tile_opened = _click_tile(page, "feedGallery")
-    print(f"    → feedGallery tile clicked: {tile_opened}")
-    time.sleep(2.5)  # wait for SWR fetch + render
-
-    # Debug: save screenshot to verify feed gallery content
+    # Debug snapshot
     dbg = OUTPUT_MP4.parent / "debug_feed_gallery.png"
     page.screenshot(path=str(dbg), full_page=False)
-    print(f"    → debug screenshot: {dbg}")
+    print(f"    → debug: {dbg}")
 
-    # Find a feed card inside the gallery
-    feed_sel = None
-    for sel in ["text=Demo – Ticketing", "text=demo_tickets", "text=demo_sales"]:
-        try:
-            if page.locator(sel).is_visible(timeout=2000):
-                feed_sel = sel
-                break
-        except Exception:
-            pass
-
-    if feed_sel:
-        r.try_scroll_into_view(feed_sel, timeout=3000)
-        time.sleep(0.4)
-        feed_box = r.element_box(feed_sel, padding=140, min_w_frac=0.50, min_h_frac=0.45)
-    else:
-        # Fall back to the whole feedGallery tile area
-        feed_box = r.element_box(
-            "[data-demo-target='feedGallery']", padding=20, min_w_frac=0.55, min_h_frac=0.50
-        )
-
-    if feed_box:
-        r.zoom_in_to(feed_box, hold_seconds=6.5, n_zoom_frames=6)
-    else:
-        r.try_scroll_into_view("[data-demo-target='feedGallery']", timeout=2000)
-        r.wait_and_snap(11)
+    r.try_scroll_into_view("[data-demo-target='feedGallery']", timeout=2000)
+    r.wait_and_snap(11)
 
     # -----------------------------------------------------------------------
-    # SCENE 4 (33–44s) — Action plan / agent insights tile
+    # SCENE 4 (33–44s) — Action plan tile
     # -----------------------------------------------------------------------
-    print("  [scene 4] Zoom → action plan / agent insights …")
+    print("  [scene 4] Action plan …")
     r.scroll_to(0)
-    time.sleep(0.3)
-
-    # Expand actionPlan tile
-    _click_tile(page, "actionPlan")
+    _expand_tile(page, "actionPlan")
     time.sleep(1.2)
-
-    agent_sel = None
-    for sel in [
-        "[data-demo-target='actionPlan']",
-        "text=Action plan",
-        "text=Action Plan",
-        "text=Agent Analysis",
-        "text=Insight",
-    ]:
-        try:
-            if page.locator(sel).count() > 0:
-                agent_sel = sel
-                break
-        except Exception:
-            pass
-
-    if agent_sel:
-        r.try_scroll_into_view(agent_sel, timeout=2000)
-        time.sleep(0.5)
-        agent_box = r.element_box(agent_sel, padding=80, min_w_frac=0.50, min_h_frac=0.42)
-    else:
-        agent_box = None
-
-    if agent_box:
-        r.zoom_in_to(agent_box, hold_seconds=6.0, n_zoom_frames=6)
-    else:
-        r.scroll_to(400)
-        r.wait_and_snap(11)
+    r.try_scroll_into_view("[data-demo-target='actionPlan']", timeout=2000)
+    r.wait_and_snap(11)
 
     # -----------------------------------------------------------------------
     # SCENE 5 (44–54s) — Model Provider in sidebar
     # -----------------------------------------------------------------------
-    print("  [scene 5] Zoom → Model Provider …")
+    print("  [scene 5] Model Provider …")
     r.scroll_to(0)
     r.try_scroll_into_view("text=Model Provider", timeout=2000)
-    time.sleep(0.4)
-
-    mp_box = r.element_box("text=Model Provider", padding=80, min_w_frac=0.22, min_h_frac=0.28)
-    if mp_box:
-        r.zoom_in_to(mp_box, hold_seconds=5.5, n_zoom_frames=6)
-    else:
-        r.wait_and_snap(10)
+    r.wait_and_snap(10)
 
     # -----------------------------------------------------------------------
-    # SCENE 6 (54–63s) — Context Chat tile (NL-to-SQL / plain English queries)
+    # SCENE 6 (54–63s) — Context Chat tile
     # -----------------------------------------------------------------------
-    print("  [scene 6] Zoom → context chat / NL-SQL …")
+    print("  [scene 6] Context Chat …")
     r.scroll_to(0)
-
-    # Expand contextChat tile
-    _click_tile(page, "contextChat")
+    _expand_tile(page, "contextChat")
     time.sleep(1.2)
-
-    nl_sel = None
-    for sel in [
-        "[data-demo-target='contextChat']",
-        "text=Context chat",
-        "text=Ask a question",
-        "textarea",
-        "text=Query",
-        "text=SQL",
-    ]:
-        try:
-            if page.locator(sel).count() > 0:
-                nl_sel = sel
-                break
-        except Exception:
-            pass
-
-    if nl_sel:
-        r.try_scroll_into_view(nl_sel, timeout=2000)
-        time.sleep(0.4)
-        nl_box = r.element_box(nl_sel, padding=100, min_w_frac=0.50, min_h_frac=0.40)
-    else:
-        nl_box = None
-
-    if nl_box:
-        r.zoom_in_to(nl_box, hold_seconds=5.0, n_zoom_frames=6)
-    else:
-        r.scroll_to(600)
-        r.wait_and_snap(9)
+    r.try_scroll_into_view("[data-demo-target='contextChat']", timeout=2000)
+    r.wait_and_snap(9)
 
     # -----------------------------------------------------------------------
-    # SCENE 7 (63–70s) — Zoom out to full dashboard, outro
+    # SCENE 7 (63–70s) — Outro wide shot
     # -----------------------------------------------------------------------
-    print("  [scene 7] Outro — wide shot …")
+    print("  [scene 7] Outro …")
     r.scroll_to(0, smooth=True)
-    time.sleep(0.6)
+    time.sleep(0.5)
     r.wait_and_snap(7)
 
-    print(f"  [done] {len(r.frames)} frames captured ({r.t:.1f}s @ {FPS}fps)")
+    print(f"  [done] {len(r.frames)} frames ({r.t:.1f}s @ {FPS}fps)")
     return r.frames
 
 
@@ -745,11 +490,10 @@ def mix_audio(silent_mp4: Path, vo_clips: list[tuple[float, Path]], out_path: Pa
 
     inputs: list[str] = ["-i", str(silent_mp4)]
     filter_parts: list[str] = []
-
     for idx, (start_sec, clip_path) in enumerate(vo_clips):
         inputs += ["-i", str(clip_path)]
         delay_ms = int(start_sec * 1000)
-        filter_parts.append(f"[{idx+1}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
+        filter_parts.append(f"[{idx + 1}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
 
     mix_inputs = "".join(f"[a{i}]" for i in range(len(vo_clips)))
     filter_parts.append(f"{mix_inputs}amix=inputs={len(vo_clips)}:normalize=0[aout]")
@@ -799,8 +543,10 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("=" * 64)
-    print("  DAWN Demo Recorder  (headless + zoom-in highlights)")
-    print(f"  Voice: Eric (ElevenLabs)  |  ~70s @ {FPS}fps")
+    print("  DAWN Demo Recorder")
+    print("  Demo data: DAWN_Demo_Workbook.xlsx")
+    print("    • Ticketing Data — 150 rows × 6 cols")
+    print("    • Sales Revenue  — 150 rows × 5 cols")
     print(f"  Output: {out_path}")
     print("=" * 64)
 
@@ -813,9 +559,9 @@ def main() -> None:
         sys.exit(1)
 
     if not backend_up:
-        print("\n⚠  Backend not reachable — feed data will be empty.\n")
+        print("\n⚠  Backend not reachable — data will not be seeded.\n")
 
-    # Pre-seed demo data before browser opens so SWR fetches populated data
+    # Seed before browser opens so SWR fetches populated data on load
     if backend_up:
         seed_demo_via_api()
         time.sleep(2)
@@ -823,19 +569,15 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp_dir = Path(td)
 
-        print("\n[vo] Generating voice-over with Eric (ElevenLabs) …")
+        print("\n[vo] Generating voice-over …")
         vo_clips = generate_vo(tmp_dir)
-        print(f"[vo] {len(vo_clips)}/{len(NARRATION)} segments generated.\n")
+        print(f"[vo] {len(vo_clips)}/{len(NARRATION)} segments ready.\n")
 
         with sync_playwright() as p:
             print("[recorder] Launching headless Chromium …")
             browser = p.chromium.launch(
                 headless=True,
-                args=[
-                    "--force-device-scale-factor=1",
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                ],
+                args=["--force-device-scale-factor=1", "--no-sandbox"],
             )
             ctx = browser.new_context(
                 viewport=VIEWPORT,
@@ -846,14 +588,12 @@ def main() -> None:
 
             print(f"[recorder] Opening {FRONTEND_URL} …")
             page.goto(FRONTEND_URL, wait_until="networkidle", timeout=30000)
-            time.sleep(2)
-
-            # Dismiss login modal via localStorage before any UI renders
+            # Dismiss login modal via localStorage
             page.evaluate("() => { localStorage.setItem('dawn.auth.dismissed', '1'); }")
             page.reload(wait_until="networkidle", timeout=20000)
             time.sleep(2)
 
-            # Also try clicking dismiss button if modal still shows
+            # Close modal if still visible
             for sel in ["button:has-text('Skip for now')", "button[aria-label='Close']"]:
                 try:
                     el = page.locator(sel).first
@@ -864,43 +604,25 @@ def main() -> None:
                 except Exception:
                     pass
 
-            # Wait for feed data to render (SWR picks up pre-seeded DB data)
-            print("  [setup] Waiting for feed gallery …", end=" ", flush=True)
-            for _ in range(20):
-                for feed_text in ["Demo – Ticketing", "demo_tickets", "demo_sales"]:
-                    try:
-                        if page.locator(f"text={feed_text}").is_visible(timeout=400):
-                            print(f"✓ ({feed_text} visible)")
-                            break
-                    except Exception:
-                        pass
-                else:
-                    time.sleep(1)
-                    continue
-                break
-            else:
-                print("(proceeding — will rely on Run Demo click)")
+            # Debug: capture state before recording
+            dbg_pre = out_path.parent / "debug_before_record.png"
+            page.screenshot(path=str(dbg_pre), full_page=False)
+            print(f"[recorder] Pre-record screenshot → {dbg_pre}")
 
-            # Debug screenshot
-            debug_path = out_path.parent / "debug_before_record.png"
-            page.screenshot(path=str(debug_path), full_page=False)
-            print(f"  [debug] Pre-record screenshot → {debug_path}")
-
-            print("[recorder] Starting choreographed capture …")
+            print("[recorder] Starting choreography …")
             frames = record_choreography(page)
             browser.close()
 
-        record_secs = len(frames) / FPS
-        print(f"\n[encoder] Encoding {len(frames)} frames ({record_secs:.0f}s) …")
+        secs = len(frames) / FPS
+        print(f"\n[encoder] {len(frames)} frames ({secs:.0f}s) …")
         silent_mp4 = frames_to_silent_mp4(frames, FPS, out_path)
-
-        print("[encoder] Mixing voice-over …")
+        print("[encoder] Mixing audio …")
         mix_audio(silent_mp4, vo_clips, out_path)
 
     size_mb = out_path.stat().st_size / 1_000_000
     print(f"\n{'=' * 64}")
-    print(f"  ✅  Done!  {out_path}")
-    print(f"     {len(frames)} frames  •  {record_secs:.0f}s  •  {size_mb:.1f} MB")
+    print(f"  ✅  {out_path}")
+    print(f"     {len(frames)} frames · {secs:.0f}s · {size_mb:.1f} MB")
     print(f"{'=' * 64}\n")
 
 
