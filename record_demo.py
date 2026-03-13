@@ -38,8 +38,7 @@ _ENV_FILE = next((p for p in _ENV_CANDIDATES if p.exists()), _ENV_CANDIDATES[-1]
 _dotenv = dotenv_values(_ENV_FILE) if _ENV_FILE.exists() else {}
 
 ELEVENLABS_API_KEY = _dotenv.get("ELEVENLABS_API_KEY") or os.getenv("ELEVENLABS_API_KEY", "")
-# Eric — smooth tenor, pitch-perfect for agentic demos
-ELEVENLABS_VOICE_ID = "cjVigY5qzO86Huf0OWal"
+ELEVENLABS_VOICE_ID = "0IdiDzv8s1u4MJX5rxvj"
 ELEVENLABS_MODEL = _dotenv.get("ELEVENLABS_MODEL_ID") or os.getenv(
     "ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"
 )
