@@ -62,44 +62,43 @@ NARRATION = [
     (
         0,
         "Dawn — AI-powered data intelligence for ops teams",
-        "This is Dawn. An AI-powered data intelligence platform built for operations teams "
-        "who need answers fast — without engineers in the loop.",
+        "This is Dawn. Drop in any spreadsheet and your ops team goes from raw data "
+        "to structured insight — without a single line of code or an engineer in the loop.",
     ),
     (
-        9,
-        "One click ingests real data and kicks off agent analysis",
-        "Hit Run Demo and Dawn ingests your spreadsheet — two real datasets, "
-        "ticketing and sales — profiles every column, and kicks off a full agent pipeline. "
-        "No configuration required.",
+        10,
+        "Drop in a spreadsheet — Dawn profiles it instantly",
+        "Drag your file in. Dawn previews the schema, detects column types, "
+        "and shows you sample rows before anything is committed.",
     ),
     (
         22,
-        "Data quality checks run automatically on every ingest",
-        "Every feed gets automatic data quality checks. Green means your data is clean. "
-        "Dawn flags issues before you even ask.",
+        "One click — data is ingested and context is live",
+        "Hit Send to Dawn. The workbook is indexed, every column profiled, "
+        "and your dataset is immediately available as a live context for querying and analysis.",
     ),
     (
-        33,
-        "Browse your feeds — live row counts, versions, DQ status",
-        "The feed gallery shows every connected dataset with live row counts, "
-        "version history, and data quality scores at a glance.",
+        34,
+        "Automatic metrics and tags — no config needed",
+        "Dawn auto-generates key metrics and infers semantic tags — "
+        "financial, temporal, geospatial — straight from your column names and values.",
     ),
     (
         44,
-        "Runs on any LLM — local or cloud",
-        "Dawn runs on whatever LLM you choose — fully local with Ollama or LM Studio "
-        "for air-gapped deployments, or cloud-powered with OpenAI or Claude. One toggle.",
+        "Seven agents analyse your data automatically",
+        "The agent swarm kicks off without prompting. A planner, executor, memory agent, "
+        "anomaly detector, drift checker, QA agent, and reporter — all running in parallel.",
     ),
     (
-        54,
+        55,
         "Ask in plain English — Dawn writes and runs the SQL",
-        "Teams ask questions in plain English. Dawn translates them to SQL, runs them "
-        "read-only against your connected data, and returns live results. Securely.",
+        "Ask anything in plain English. Dawn translates it to SQL, "
+        "runs it read-only against your data, and returns live results. Securely, in seconds.",
     ),
     (
-        63,
-        "Dawn — from raw data to insight in seconds",
-        "Dawn. From raw data to boardroom-ready insight in seconds. "
+        65,
+        "Dawn — raw data to insight in seconds",
+        "Dawn. From raw spreadsheet to boardroom-ready insight in seconds. "
         "Private, fast, and built for the ops teams who can't wait.",
     ),
 ]
@@ -250,33 +249,7 @@ def wait_for_url(url: str, label: str, timeout: int = 30) -> bool:
     return False
 
 
-def seed_demo_via_api() -> bool:
-    """
-    POST /demo/seed before browser opens so feeds are in the DB.
-    Returns True if at least one feed was ingested or already exists.
-    """
-    print("[setup] Seeding demo workspace via API …", end=" ", flush=True)
-    try:
-        resp = _req.post(f"{BACKEND_URL}/demo/seed", timeout=60)
-        if resp.status_code in (200, 201):
-            data = resp.json()
-            feeds = data.get("feeds", [])
-            errors = data.get("errors", [])
-            print(f"✓  ({len(feeds)} feeds)")
-            for f in feeds:
-                print(
-                    f"    • {f.get('identifier')}  [{f.get('status')}]"
-                    f"  {f.get('rows', '?')} rows"
-                )
-            if errors:
-                for e in errors:
-                    print(f"    ⚠  {e}")
-            return bool(feeds)
-        print(f"✗ HTTP {resp.status_code}: {resp.text[:200]}")
-        return False
-    except Exception as exc:
-        print(f"✗ {exc}")
-        return False
+DEMO_WORKBOOK = Path(__file__).parent / "docs" / "DAWN_Demo_Workbook.xlsx"
 
 
 # ---------------------------------------------------------------------------
@@ -363,79 +336,122 @@ def _expand_tile(page, tile_id: str) -> bool:
         return False
 
 
+def _wait_for_text(page, text: str, timeout: int = 15) -> bool:
+    """Poll until `text` appears anywhere on the page."""
+    for _ in range(timeout):
+        try:
+            if page.locator(f"text={text}").count() > 0:
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
 def record_choreography(page) -> list[bytes]:
     r = Recorder(page, fps=FPS)
 
     # -----------------------------------------------------------------------
-    # SCENE 1 (0–9s) — Dashboard overview, sidebar visible
+    # SCENE 1 (0–10s) — Dashboard wide shot
     # -----------------------------------------------------------------------
     print("  [scene 1] Dashboard overview …")
     r.scroll_to(0)
     time.sleep(1.0)
-    r.wait_and_snap(9)
-
-    # -----------------------------------------------------------------------
-    # SCENE 2 (9–22s) — Click Run Demo, watch seeding feedback
-    # Ingests DAWN_Demo_Workbook.xlsx: "Ticketing Data" + "Sales Revenue" sheets
-    # -----------------------------------------------------------------------
-    print("  [scene 2] Run Demo …")
-    r.scroll_to(0)
-    time.sleep(0.3)
-    clicked = r.try_click("button:has-text('Run Demo')", timeout=3000)
-    print(f"    → clicked: {clicked}")
-    r.wait_and_snap(13)  # show "Seeding workspace…" → "✓ Seeded N feeds" feedback
-
-    # -----------------------------------------------------------------------
-    # SCENE 3 (22–33s) — Feed gallery with real cards + DQ badges
-    # -----------------------------------------------------------------------
-    print("  [scene 3] Feed gallery …")
-    expanded = _expand_tile(page, "feedGallery")
-    print(f"    → feedGallery tile expanded: {expanded}")
-    time.sleep(2.5)  # wait for SWR fetch after tile mounts
-
-    # Debug snapshot
-    dbg = OUTPUT_MP4.parent / "debug_feed_gallery.png"
-    page.screenshot(path=str(dbg), full_page=False)
-    print(f"    → debug: {dbg}")
-
-    r.try_scroll_into_view("[data-demo-target='feedGallery']", timeout=2000)
-    r.wait_and_snap(11)
-
-    # -----------------------------------------------------------------------
-    # SCENE 4 (33–44s) — Action plan tile
-    # -----------------------------------------------------------------------
-    print("  [scene 4] Action plan …")
-    r.scroll_to(0)
-    _expand_tile(page, "actionPlan")
-    time.sleep(1.2)
-    r.try_scroll_into_view("[data-demo-target='actionPlan']", timeout=2000)
-    r.wait_and_snap(11)
-
-    # -----------------------------------------------------------------------
-    # SCENE 5 (44–54s) — Model Provider in sidebar
-    # -----------------------------------------------------------------------
-    print("  [scene 5] Model Provider …")
-    r.scroll_to(0)
-    r.try_scroll_into_view("text=Model Provider", timeout=2000)
     r.wait_and_snap(10)
 
     # -----------------------------------------------------------------------
-    # SCENE 6 (54–63s) — Context Chat tile
+    # SCENE 2 (10–22s) — Expand Upload tile, drop in the workbook, click Preview
     # -----------------------------------------------------------------------
-    print("  [scene 6] Context Chat …")
-    r.scroll_to(0)
-    _expand_tile(page, "contextChat")
-    time.sleep(1.2)
-    r.try_scroll_into_view("[data-demo-target='contextChat']", timeout=2000)
-    r.wait_and_snap(9)
+    print("  [scene 2] Upload tile — file drop + Preview …")
+    _expand_tile(page, "upload")
+    time.sleep(1.0)
+    r.try_scroll_into_view("[data-demo-target='upload']", timeout=2000)
+    r.wait_and_snap(2)  # show the upload zone clearly
+
+    # Set the file on the hidden input — real file ingestion, no shortcuts
+    file_input = page.locator("input[type='file']").first
+    file_input.set_input_files(str(DEMO_WORKBOOK))
+    time.sleep(1.0)
+    r.wait_and_snap(2)  # show filename / "Ready to preview" status
+
+    # Click Preview
+    r.try_click("button:has-text('Preview')", timeout=3000)
+    print("    → clicked Preview")
+    time.sleep(0.5)
+    r.wait_and_snap(4)  # show preview loading → sample rows appear
 
     # -----------------------------------------------------------------------
-    # SCENE 7 (63–70s) — Outro wide shot
+    # SCENE 3 (22–34s) — Click "Send to Dawn", watch ingestion + status
+    # -----------------------------------------------------------------------
+    print("  [scene 3] Send to Dawn — ingestion …")
+    r.try_click("button:has-text('Send to Dawn')", timeout=5000)
+    print("    → clicked Send to Dawn")
+    time.sleep(0.5)
+    r.wait_and_snap(3)  # "Sending…" spinner visible
+
+    # Wait for "✓ Indexed" confirmation (real backend call)
+    print("    → waiting for index confirmation …", end=" ", flush=True)
+    confirmed = _wait_for_text(page, "Indexed", timeout=20)
+    print("✓" if confirmed else "timed out")
+    r.wait_and_snap(4)  # show "✓ Indexed" status message
+
+    # -----------------------------------------------------------------------
+    # SCENE 4 (34–44s) — Insight tile auto-populated with metrics + tags
+    # -----------------------------------------------------------------------
+    print("  [scene 4] Insight tile …")
+    _expand_tile(page, "insight")
+    time.sleep(1.0)
+    r.try_scroll_into_view("[data-demo-target='insight']", timeout=2000)
+    r.wait_and_snap(10)
+
+    # -----------------------------------------------------------------------
+    # SCENE 5 (44–55s) — Agent swarm tile running analysis
+    # -----------------------------------------------------------------------
+    print("  [scene 5] Agent swarm …")
+    r.scroll_to(0)
+    _expand_tile(page, "agent")
+    time.sleep(1.0)
+    r.try_scroll_into_view("[data-demo-target='agent']", timeout=2000)
+    # Click Run if available — agent needs an active feed/source
+    r.try_click("[data-demo-target='agent'] button:has-text('Run')", timeout=2000)
+    time.sleep(0.5)
+    r.wait_and_snap(10)
+
+    # -----------------------------------------------------------------------
+    # SCENE 6 (55–65s) — Context Chat — NL to SQL
+    # -----------------------------------------------------------------------
+    print("  [scene 6] Context Chat / NL-to-SQL …")
+    r.scroll_to(0)
+    _expand_tile(page, "contextChat")
+    time.sleep(1.0)
+    r.try_scroll_into_view("[data-demo-target='contextChat']", timeout=2000)
+    r.wait_and_snap(3)
+
+    # Type a sample question to show the NL-to-SQL flow
+    question = "What are the top 5 ticket categories by volume?"
+    try:
+        ta = page.locator("[data-demo-target='contextChat'] textarea").first
+        if not ta.count():
+            ta = page.locator("textarea").first
+        if ta.is_visible(timeout=2000):
+            ta.click()
+            ta.type(question, delay=40)
+            r.wait_and_snap(2)  # show question typed in
+            # Submit
+            page.keyboard.press("Enter")
+            time.sleep(0.5)
+            r.wait_and_snap(4)  # show response / SQL loading
+    except Exception as exc:
+        print(f"    → chat input error: {exc}")
+        r.wait_and_snap(7)
+
+    # -----------------------------------------------------------------------
+    # SCENE 7 (65–73s) — Outro wide shot
     # -----------------------------------------------------------------------
     print("  [scene 7] Outro …")
     r.scroll_to(0, smooth=True)
     time.sleep(0.5)
-    r.wait_and_snap(7)
+    r.wait_and_snap(8)
 
     print(f"  [done] {len(r.frames)} frames ({r.t:.1f}s @ {FPS}fps)")
     return r.frames
@@ -543,10 +559,9 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("=" * 64)
-    print("  DAWN Demo Recorder")
-    print("  Demo data: DAWN_Demo_Workbook.xlsx")
-    print("    • Ticketing Data — 150 rows × 6 cols")
-    print("    • Sales Revenue  — 150 rows × 5 cols")
+    print("  DAWN Demo Recorder — real upload workflow")
+    print("  File: DAWN_Demo_Workbook.xlsx")
+    print("  Flow: upload → preview → ingest → insights → agents → NL-SQL")
     print(f"  Output: {out_path}")
     print("=" * 64)
 
@@ -559,12 +574,15 @@ def main() -> None:
         sys.exit(1)
 
     if not backend_up:
-        print("\n⚠  Backend not reachable — data will not be seeded.\n")
+        print("\n⚠  Backend not reachable — ingestion will fail.\n")
 
-    # Seed before browser opens so SWR fetches populated data on load
-    if backend_up:
-        seed_demo_via_api()
-        time.sleep(2)
+    if not DEMO_WORKBOOK.exists():
+        print(f"\n⚠  Demo workbook not found: {DEMO_WORKBOOK}\n")
+        sys.exit(1)
+
+    print(
+        f"[setup] Demo workbook: {DEMO_WORKBOOK.name} ({DEMO_WORKBOOK.stat().st_size // 1024} KB)"
+    )
 
     with tempfile.TemporaryDirectory() as td:
         tmp_dir = Path(td)
