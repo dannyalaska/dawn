@@ -79,14 +79,14 @@ export default function FeedGallery({
               onSelectFeed?.({ feed, source: sourceHint });
             }}
           >
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs uppercase tracking-[0.3em] text-slate-400">{feed.identifier}</p>
-                <p className="text-xl font-semibold text-white">{feed.name}</p>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="truncate text-xs uppercase tracking-[0.3em] text-slate-400">{feed.identifier}</p>
+                <p className="truncate text-xl font-semibold text-white">{feed.name}</p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-shrink-0 items-center gap-2 pt-1">
                 {dqBadge && (
-                  <span className={clsx('rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.06em]', dqBadge.classes)}>
+                  <span className={clsx('whitespace-nowrap rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.06em]', dqBadge.classes)}>
                     {dqBadge.label}
                   </span>
                 )}
