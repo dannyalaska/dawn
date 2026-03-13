@@ -258,3 +258,73 @@ def _rows_to_table_entries(rows: list[tuple[str, str, str]]) -> list[dict[str, A
             }
         )
     return entries
+
+
+def execute_query(
+    kind: str,
+    config: dict[str, Any],
+    sql: str,
+    *,
+    row_limit: int = 500,
+) -> dict[str, Any]:
+    """
+    Execute a read-only SQL query against a backend connection.
+    Returns {ok, columns, rows, row_count, truncated} or {ok: False, error: ...}.
+    """
+    import sqlglot  # noqa: PLC0415
+
+    # Enforce read-only via AST check
+    try:
+        statements = sqlglot.parse(sql)
+        if len(statements) != 1:
+            return {"ok": False, "error": "Only a single SQL statement is allowed."}
+        stmt = statements[0]
+        from sqlglot import exp  # noqa: PLC0415
+
+        if isinstance(stmt, exp.Insert | exp.Update | exp.Delete | exp.Command):
+            return {"ok": False, "error": "Write operations are not permitted."}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"SQL parse error: {exc}"}
+
+    try:
+        if kind == "postgres":
+            conn = _postgres_connection(config)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                    columns = [desc[0] for desc in (cur.description or [])]
+                    raw_rows = cur.fetchmany(row_limit + 1)
+            finally:
+                conn.close()
+
+        elif kind == "snowflake":
+            ctx = _snowflake_cursor(config)
+            cursor = ctx.cursor()
+            try:
+                cursor.execute(sql)
+                columns = [desc[0] for desc in (cursor.description or [])]
+                raw_rows = cursor.fetchmany(row_limit + 1)
+            finally:
+                with suppress(Exception):
+                    cursor.close()
+                with suppress(Exception):
+                    ctx.close()
+
+        else:
+            return {
+                "ok": False,
+                "error": f"Query execution not supported for backend kind '{kind}'.",
+            }
+
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"Query execution error: {exc}"}
+
+    truncated = len(raw_rows) > row_limit
+    rows = [dict(zip(columns, row, strict=False)) for row in raw_rows[:row_limit]]
+    return {
+        "ok": True,
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows),
+        "truncated": truncated,
+    }

@@ -643,7 +643,16 @@ def add_manual_note(user_id: str, source: str, note: str) -> dict[str, Any]:
     upsert_chunks([chunk], user_id=user_id)
     doc_id = hashlib.sha1((user_id + chunk.source + chunk.text).encode("utf-8")).hexdigest()[:16]
     key = _doc_key(user_id, doc_id)
-    stored = redis_sync.hgetall(key)
+    stored_raw = redis_binary.hgetall(key)
+
+    def _decode(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="ignore")
+        return str(value)
+
+    stored = {(_decode(k) or ""): _decode(v) for k, v in stored_raw.items()}
     metadata_raw = stored.get("metadata")
     tags: list[str] = []
     if metadata_raw:

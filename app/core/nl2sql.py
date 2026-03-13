@@ -12,7 +12,7 @@ import sqlglot
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, StateGraph
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlglot import exp
 
 from app.core.backend_connectors import (
@@ -22,7 +22,7 @@ from app.core.backend_connectors import (
 )
 from app.core.chat_models import StubChatModel, get_chat_model
 from app.core.config import settings
-from app.core.db import session_scope
+from app.core.db import get_engine, session_scope
 from app.core.models import (
     BackendConnection,
     Feed,
@@ -34,6 +34,8 @@ from app.core.models import (
 from app.core.rag import format_context, search
 from app.core.redis_client import redis_sync
 from app.core.transforms import TransformDefinition
+
+MAX_SQL_ROWS = int(os.getenv("DAWN_SQL_ROW_LIMIT", "500"))
 
 RECENT_KEY = "dawn:nl2sql:recent_questions"
 
@@ -180,6 +182,57 @@ def build_manifest(
     manifests.extend(_feed_dataset_manifests(numeric_user))
     manifests.extend(_backend_table_manifests(numeric_user))
     return manifests
+
+
+def build_feed_dataset_manifest(*, user_id: str | int, feed_identifier: str) -> list[TableManifest]:
+    numeric_user = _ensure_int_user_id(user_id)
+    with session_scope() as session:
+        feed = (
+            session.execute(
+                select(Feed).where(Feed.user_id == numeric_user, Feed.identifier == feed_identifier)
+            )
+            .scalars()
+            .first()
+        )
+        if feed is None:
+            return []
+        latest_version = (
+            session.execute(
+                select(FeedVersion)
+                .where(FeedVersion.feed_id == feed.id)
+                .order_by(FeedVersion.version.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+        if latest_version is None:
+            return []
+        dataset = (
+            session.execute(
+                select(FeedDataset).where(FeedDataset.feed_version_id == latest_version.id)
+            )
+            .scalars()
+            .first()
+        )
+        if dataset is None:
+            return []
+        schema_name = dataset.schema_name or "public"
+        return [
+            TableManifest(
+                name=dataset.table_name,
+                columns=list(dataset.columns or []),
+                source=f"feed_dataset:{dataset.id}",
+                primary_keys=[],
+                foreign_keys=[],
+                description=f"{feed.name} materialized",
+                kind="feed_table",
+                schema=schema_name,
+                table=dataset.table_name,
+                connection_id=dataset.id,
+                dialect="postgres",
+            )
+        ]
 
 
 def _backend_table_manifests(user_id: int) -> list[TableManifest]:
@@ -399,6 +452,12 @@ def _normalize_sql_columns(
             manifest_table = alias_map.get(table_ref) or lookup.get(table_ref)
         if manifest_table:
             if column_name in manifest_table.columns:
+                if _needs_quoting(column_name):
+                    column.set(
+                        "this",
+                        exp.Identifier(this=column_name, quoted=True),
+                    )
+                    warnings.append(f'Quoted column "{column_name}" in {manifest_table.name}')
                 continue
             norm = _normalize_identifier(column_name)
             candidates = table_maps.get(manifest_table.name, {}).get(norm, [])
@@ -418,12 +477,15 @@ def _normalize_sql_columns(
         candidates = global_map.get(norm, [])
         if len(candidates) == 1:
             canonical = candidates[0]
-            if canonical != column_name:
+            if canonical != column_name or _needs_quoting(canonical):
                 column.set(
                     "this",
                     exp.Identifier(this=canonical, quoted=_needs_quoting(canonical)),
                 )
-                warnings.append(f'Normalized column {column_name} -> "{canonical}"')
+                if canonical != column_name:
+                    warnings.append(f'Normalized column {column_name} -> "{canonical}"')
+                elif _needs_quoting(canonical):
+                    warnings.append(f'Quoted column "{canonical}"')
 
     try:
         normalized = statement.sql(dialect=dialect)
@@ -474,12 +536,92 @@ def _repair_sql(
         return repaired, warnings
 
 
+def _ensure_limit(statement: exp.Expression, limit: int) -> exp.Expression:
+    if not hasattr(statement, "is_select") or not statement.is_select:
+        return statement
+    existing_limit = statement.args.get("limit")
+    if existing_limit and isinstance(existing_limit, exp.Limit):
+        try:
+            current = int(existing_limit.expression.name)
+        except Exception:
+            current = limit
+        if current <= limit:
+            return statement
+    statement.set("limit", exp.Limit(this=exp.Literal.number(limit)))
+    return statement
+
+
+def execute_sql(
+    sql_text: str,
+    *,
+    manifest: list[TableManifest],
+    dialect: str = "postgres",
+    limit: int | None = None,
+) -> dict[str, Any]:
+    if limit is None:
+        limit = MAX_SQL_ROWS
+    validation = validate_sql(sql_text, manifest, allow_writes=False, dialect=dialect)
+    if not validation.get("ok"):
+        return {"ok": False, "validation": validation, "sql": sql_text}
+
+    try:
+        statement = sqlglot.parse_one(sql_text, read=dialect)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"SQL parse error: {exc}", "sql": sql_text}
+
+    statement = _ensure_limit(statement, limit)
+    limited_sql = statement.sql(dialect=dialect)
+
+    engine = get_engine()
+    rows: list[dict[str, Any]] = []
+    columns: list[str] = []
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(limited_sql))
+            columns = list(result.keys())
+            for row in result.fetchall():
+                rows.append({col: row[idx] for idx, col in enumerate(columns)})
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "sql": limited_sql,
+            "error": f"SQL execution error: {exc}",
+            "validation": validation,
+        }
+
+    return {
+        "ok": True,
+        "sql": limited_sql,
+        "rows": rows,
+        "columns": columns,
+        "row_count": len(rows),
+        "truncated": len(rows) >= limit,
+        "validation": validation,
+    }
+
+
+_FEW_SHOT_EXAMPLES = """
+Examples of correct SQL output (no markdown, no explanation):
+Q: How many tickets are open?
+A: SELECT COUNT(*) AS open_tickets FROM tickets WHERE status = 'Open';
+
+Q: Show top 5 agents by ticket count
+A: SELECT assigned_to, COUNT(*) AS ticket_count FROM tickets GROUP BY assigned_to ORDER BY ticket_count DESC LIMIT 5;
+
+Q: What is the average resolution time by priority?
+A: SELECT priority, AVG(resolution_time_hours) AS avg_hours FROM tickets GROUP BY priority ORDER BY avg_hours;
+
+Q: List all duplicate email addresses
+A: SELECT email, COUNT(*) AS occurrences FROM users GROUP BY email HAVING COUNT(*) > 1;
+"""
+
 PROMPT_TEMPLATE = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You convert natural-language analytics questions into SQL. Return a single SQL "
-            "statement with no commentary, explanations, or markdown fences.",
+            "You convert natural-language analytics questions into SQL. "
+            "Return a single SQL statement with NO commentary, NO explanations, and NO markdown fences. "
+            "Output only valid SQL.\n" + _FEW_SHOT_EXAMPLES,
         ),
         ("human", "{prompt}"),
     ]
@@ -643,6 +785,7 @@ def _interpret_question(question: str, manifest: list[TableManifest], model: Any
 
 @lru_cache(maxsize=4)
 def _compiled_graph(provider: str) -> Any:
+    # Use temperature=0.0 for deterministic SQL generation; intent model can stay at 0.1
     model = get_chat_model(provider)
     parser = StrOutputParser()
     graph = StateGraph(NL2SQLState)
@@ -704,8 +847,7 @@ def _compiled_graph(provider: str) -> Any:
 def _run_graph(
     question: str, manifest: list[TableManifest], recent: list[str], *, user_id: str, k: int = 4
 ) -> dict[str, Any]:
-    env_provider = os.getenv("LLM_PROVIDER")
-    provider = (env_provider or settings.LLM_PROVIDER or "stub").lower()
+    provider = settings.LLM_PROVIDER.lower() if settings.LLM_PROVIDER else "stub"
     graph = _compiled_graph(provider)
     return graph.invoke(
         {
@@ -840,6 +982,71 @@ def nl_to_sql(
     user_id: str = "default",
 ) -> dict[str, Any]:
     manifest = build_manifest(user_id=user_id, feed_identifiers=feed_identifiers)
+    recent = _load_recent_questions(user_id=user_id)
+    state = _run_graph(question, manifest, recent, user_id=user_id)
+    prompt = state.get("prompt") or _prompt(
+        question, manifest, recent, state.get("rag_context", ""), state.get("intent")
+    )
+    sql_text = state.get("sql") or _clean_sql(state.get("raw_sql", ""))
+    sql_text, repair_warnings = _repair_sql(sql_text, manifest, dialect=dialect)
+    sql_text, normalization_warnings = _normalize_sql_columns(sql_text, manifest, dialect=dialect)
+    hits = state.get("hits", [])
+    validation = validate_sql(sql_text, manifest, allow_writes=allow_writes, dialect=dialect)
+    if normalization_warnings or repair_warnings:
+        warnings = list(validation.get("warnings") or [])
+        for warning in repair_warnings + normalization_warnings:
+            if warning not in warnings:
+                warnings.append(warning)
+        validation["warnings"] = warnings
+    explain_plan = explain_stub(sql_text, dialect) if explain and validation.get("ok") else None
+
+    if validation.get("ok"):
+        _record_question(question, user_id=user_id)
+
+    return {
+        "sql": sql_text,
+        "prompt": prompt,
+        "manifest": [asdict(table) for table in manifest],
+        "intent": state.get("intent"),
+        "validation": validation,
+        "citations": {
+            "tables": validation.get("tables", []),
+            "columns": validation.get("columns", []),
+            "context": hits,
+        },
+        "explain": explain_plan,
+        "recent_questions": recent,
+    }
+
+
+def nl_to_sql_for_feed_dataset(
+    question: str,
+    *,
+    feed_identifier: str,
+    allow_writes: bool = False,
+    dialect: str = "postgres",
+    explain: bool = False,
+    user_id: str = "default",
+) -> dict[str, Any]:
+    manifest = build_feed_dataset_manifest(user_id=user_id, feed_identifier=feed_identifier)
+    if not manifest:
+        return {
+            "sql": "",
+            "prompt": "",
+            "manifest": [],
+            "intent": None,
+            "validation": {
+                "ok": False,
+                "errors": [f"No dataset table found for feed {feed_identifier}"],
+                "warnings": [],
+                "tables": [],
+                "columns": [],
+            },
+            "citations": {"tables": [], "columns": [], "context": []},
+            "explain": None,
+            "recent_questions": _load_recent_questions(user_id=user_id),
+        }
+
     recent = _load_recent_questions(user_id=user_id)
     state = _run_graph(question, manifest, recent, user_id=user_id)
     prompt = state.get("prompt") or _prompt(

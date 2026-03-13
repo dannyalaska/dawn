@@ -33,16 +33,25 @@ class Settings(BaseSettings):
     MAX_REMOTE_BYTES: int = 25_000_000
 
     # LLM knobs (safe defaults; can be overridden via .env)
-    LLM_PROVIDER: str = "stub"  # stub | ollama | openai
+    # Supported providers: stub | ollama | openai | lmstudio | anthropic
+    LLM_PROVIDER: str = "stub"
     OPENAI_API_KEY: str | None = None
-    OPENAI_MODEL: str | None = "gpt-4o-mini"
-    OLLAMA_MODEL: str | None = "llama3.1"
+    OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_BASE_URL: str | None = None
+    OLLAMA_MODEL: str = "llama3.1"
+    OLLAMA_BASE_URL: str = "http://127.0.0.1:11434"
+    ANTHROPIC_API_KEY: str | None = None
+    ANTHROPIC_MODEL: str = "claude-sonnet-4-6"
 
     # Auth
     AUTH_REQUIRED: bool = False
 
     # Dangerous operations
     ALLOW_RESET: bool = False
+
+    # Notifications (Telegram)
+    TELEGRAM_BOT_TOKEN: str | None = None
+    TELEGRAM_CHAT_ID: str | None = None
 
 
 settings = Settings()

@@ -291,7 +291,11 @@ export default function ContextChatPanel({ disabled, source, activeFeedId, memor
         });
     }
     try {
-      const response = await chatRag(ragMessagesRef.current, { token, apiBase });
+      const response = await chatRag(ragMessagesRef.current, {
+        token,
+        apiBase,
+        feedIdentifier: activeFeedId ?? undefined
+      });
       let merged: RagMessage[] = [];
       if (response.messages && response.messages.length > 0) {
         merged = response.messages as RagMessage[];
@@ -307,6 +311,32 @@ export default function ContextChatPanel({ disabled, source, activeFeedId, memor
           ...prev,
           { id: buildMessageId(), role: 'assistant', content: assistantMsg.content, kind: 'chat' }
         ]);
+      }
+      if (response.sql_result) {
+        const rowCount = response.sql_result.row_count ?? response.sql_result.rows?.length ?? 0;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: buildMessageId(),
+            role: 'assistant',
+            content: `SQL results ready (${rowCount} rows). Open Preview to view.`,
+            kind: 'note'
+          }
+        ]);
+        window.dispatchEvent(
+          new CustomEvent('nl2sql:result', {
+            detail: {
+              question: trimmed,
+              sql: response.sql_result.sql,
+              details: '',
+              validation: response.sql_result.validation,
+              rows: response.sql_result.rows,
+              columns: response.sql_result.columns,
+              row_count: response.sql_result.row_count,
+              truncated: response.sql_result.truncated
+            }
+          })
+        );
       }
       setSources(response.sources || []);
       setInput('');
@@ -393,6 +423,19 @@ export default function ContextChatPanel({ disabled, source, activeFeedId, memor
       <div className="mb-4">
         <p className="text-xs uppercase tracking-[0.4em] text-slate-400">RAG chat</p>
         <h3 className="mt-2 text-lg font-semibold text-white">Ask questions about your data</h3>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() =>
+              window.dispatchEvent(
+                new CustomEvent('demo:focus-tile', { detail: { tileId: 'preview' } })
+              )
+            }
+            className="rounded-full border border-white/10 bg-black/30 px-3 py-1 text-[11px] uppercase tracking-[0.3em] text-slate-300 hover:border-white/30"
+          >
+            Jump to Preview
+          </button>
+        </div>
       </div>
 
       {/* Messages area */}

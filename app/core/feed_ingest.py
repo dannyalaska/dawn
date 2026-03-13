@@ -929,6 +929,18 @@ def ingest_feed(
             )
             summary_payload["materialized_table"] = materialized_table_info
 
+    # Run DQ rules against the materialized table (best-effort)
+    dq_outcomes: list[Any] = []
+    if pending_dataset:
+        try:
+            from app.core.dq_runner import dq_summary, run_dq_rules  # noqa: PLC0415
+
+            with session_scope() as dq_s:
+                dq_outcomes = run_dq_rules(pending_dataset["feed_version_id"], dq_s)
+            summary_payload["dq"] = dq_summary(dq_outcomes)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DQ rule evaluation failed: %s", exc, exc_info=True)
+
     return {
         "feed": {
             "identifier": identifier,

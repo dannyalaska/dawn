@@ -19,6 +19,7 @@ import ChartsPanel from '@/components/panels/ChartsPanel';
 import WorkspaceOverviewPanel from '@/components/panels/WorkspaceOverviewPanel';
 import ActivityFeed, { type ActivityItem } from '@/components/ui/ActivityFeed';
 import { DemoModeOverlay } from '@/components/ui/DemoMode';
+import LoginModal from '@/components/ui/LoginModal';
 import { useDemoMode } from '@/hooks/useDemoMode';
 import type { AgentRunSummary, FeedRecord, IndexExcelResponse, PreviewTable } from '@/lib/types';
 
@@ -156,12 +157,12 @@ export default function DawnExperience() {
   const tileOrder = useMemo(
     () => [
       'upload',
-      'contextChat',
-      'agent',
       'preview',
+      'agent',
+      'contextChat',
+      'insight',
       'charts',
       'agentOrbit',
-      'insight',
       'feedGallery',
       'context',
       'contextNotes',
@@ -430,6 +431,7 @@ export default function DawnExperience() {
 
   return (
     <div className="space-y-8">
+      <LoginModal />
       <DemoModeOverlay
         isVisible={demoMode.isActive}
         currentStep={demoMode.currentStep}

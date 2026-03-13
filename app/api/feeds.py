@@ -12,7 +12,7 @@ from app.core.auth import CurrentUser
 from app.core.db import session_scope
 from app.core.feed_ingest import FeedIngestConflict, FeedIngestError, ingest_feed
 from app.core.limits import SizeLimitError, read_upload_bytes
-from app.core.models import Feed, FeedVersion
+from app.core.models import DQResult, DQRule, Feed, FeedVersion
 
 router = APIRouter(prefix="/feeds", tags=["feeds"])
 
@@ -177,6 +177,88 @@ def feed_detail(identifier: str, current_user: CurrentUser) -> dict[str, Any]:
             for version in versions
         ]
     return payload
+
+
+@router.get("/{identifier}/dq")
+def feed_dq(identifier: str, current_user: CurrentUser) -> dict[str, Any]:
+    """Return the latest DQ rule results for a feed."""
+    with session_scope() as session:
+        feed = session.scalars(
+            select(Feed).where(
+                Feed.identifier == identifier.strip(), Feed.user_id == current_user.id
+            )
+        ).first()
+        if feed is None:
+            raise HTTPException(404, f"Feed {identifier!r} not found")
+
+        latest_version = session.scalars(
+            select(FeedVersion)
+            .where(FeedVersion.feed_id == feed.id)
+            .order_by(FeedVersion.version.desc())
+            .limit(1)
+        ).first()
+        if latest_version is None:
+            return {
+                "feed": identifier,
+                "version": None,
+                "rules": [],
+                "summary": {"status": "no_rules"},
+            }
+
+        rules = session.scalars(
+            select(DQRule).where(DQRule.feed_version_id == latest_version.id)
+        ).all()
+
+        rule_ids = [r.id for r in rules]
+        results_by_rule: dict[int, DQResult] = {}
+        if rule_ids:
+            latest_results = session.scalars(
+                select(DQResult)
+                .where(DQResult.rule_id.in_(rule_ids))
+                .order_by(DQResult.created_at.desc())
+            ).all()
+            for res in latest_results:
+                if res.rule_id not in results_by_rule:
+                    results_by_rule[res.rule_id] = res
+
+        rule_payloads = []
+        total = fail = skip = 0
+        for rule in rules:
+            result = results_by_rule.get(rule.id)
+            status = result.status if result else "pending"
+            total += 1
+            if status == "fail":
+                fail += 1
+            elif status == "skip":
+                skip += 1
+            rule_payloads.append(
+                {
+                    "id": rule.id,
+                    "rule_type": rule.rule_type,
+                    "column_name": rule.column_name,
+                    "description": rule.description,
+                    "severity": rule.severity,
+                    "status": status,
+                    "details": result.details if result else None,
+                    "evaluated_at": (
+                        result.created_at.isoformat() if result and result.created_at else None
+                    ),
+                }
+            )
+
+        overall = "pass" if fail == 0 and total > 0 else ("fail" if fail > 0 else "pending")
+        return {
+            "feed": identifier,
+            "version": latest_version.version,
+            "rules": rule_payloads,
+            "summary": {
+                "status": overall,
+                "total": total,
+                "pass": total - fail - skip,
+                "fail": fail,
+                "skip": skip,
+            },
+        }
 
 
 class FavoriteRequest(BaseModel):

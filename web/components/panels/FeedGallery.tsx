@@ -54,6 +54,16 @@ export default function FeedGallery({
           (activeSource && sourceHint && activeSource === sourceHint) ||
           (activeFeedId && activeFeedId === feed.identifier);
         const tags = (latest?.summary?.tags as string[] | undefined) ?? [];
+        const dq = (latest?.summary as Record<string, unknown> | undefined)?.dq as
+          | { status: string; pass: number; fail: number; total: number }
+          | undefined;
+        const dqBadge = dq
+          ? dq.status === 'pass'
+            ? { label: `DQ ${dq.pass}/${dq.total}`, classes: 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25' }
+            : dq.status === 'fail'
+            ? { label: `DQ ${dq.fail} fail`, classes: 'bg-rose-500/15 text-rose-300 border border-rose-500/25' }
+            : { label: 'DQ skip', classes: 'bg-white/5 text-slate-400 border border-white/10' }
+          : null;
         return (
           <button
             type="button"
@@ -74,7 +84,14 @@ export default function FeedGallery({
                 <p className="text-xs uppercase tracking-[0.3em] text-slate-400">{feed.identifier}</p>
                 <p className="text-xl font-semibold text-white">{feed.name}</p>
               </div>
-              <ArrowRightIcon className="h-5 w-5 text-slate-400 transition group-hover:translate-x-1 group-hover:text-white" />
+              <div className="flex items-center gap-2">
+                {dqBadge && (
+                  <span className={clsx('rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.06em]', dqBadge.classes)}>
+                    {dqBadge.label}
+                  </span>
+                )}
+                <ArrowRightIcon className="h-5 w-5 text-slate-400 transition group-hover:translate-x-1 group-hover:text-white" />
+              </div>
             </div>
             {latest && (
               <dl className="mt-4 grid grid-cols-3 gap-3 text-center">

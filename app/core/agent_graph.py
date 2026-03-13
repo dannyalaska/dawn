@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import logging
+import re
+import time
 import uuid
 from functools import lru_cache
 from typing import Any, TypedDict
@@ -16,6 +20,8 @@ from app.core.chat_graph import run_chat
 from app.core.db import session_scope
 from app.core.models import BackendConnection, Feed, FeedDataset, FeedVersion
 from app.core.rag import Chunk, upsert_chunks
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["AgentRunError", "run_multi_agent_session"]
 
@@ -72,6 +78,8 @@ class AgentState(TypedDict, total=False):
     final_report: str
     retrieval_k: int
     max_plan_steps: int
+    agent_trace: list[dict[str, Any]]
+    plan_reasoning: str
 
 
 def _ensure_int_user_id(user_id: str) -> int:
@@ -229,6 +237,80 @@ def _load_backend_sources(user_id: str) -> list[dict[str, Any]]:
     return sources
 
 
+_LLM_TASK_TYPES = (
+    "count_by, avg_by, null_audit, drift_check, top_n, correlation_hint, "
+    "date_range, row_delta, schema_inventory"
+)
+
+
+def _llm_derive_plan(
+    summary: dict[str, Any],
+    goal: str,
+    backend_sources: list[dict[str, Any]],
+    limit: int,
+) -> tuple[list[dict[str, Any]], str]:
+    """
+    Ask the LLM to generate a custom analysis plan.
+    Returns (steps, reasoning). Raises on failure so caller can fall back.
+    """
+    from app.core.chat_models import get_chat_model  # noqa: PLC0415
+    from app.core.config import settings  # noqa: PLC0415
+
+    if settings.LLM_PROVIDER == "stub":
+        raise ValueError("provider=stub — skipping LLM planner")
+
+    cols = (summary.get("columns") or [])[:12]
+    col_info = [
+        {
+            "name": c.get("name"),
+            "dtype": c.get("dtype"),
+            "null_pct": round(float(c.get("null_percent", 0)), 1),
+        }
+        for c in cols
+        if isinstance(c, dict) and c.get("name")
+    ]
+    drift = summary.get("drift") or {}
+    schema_prompt = json.dumps(col_info, separators=(",", ":"))
+    drift_hint = (
+        f"Row delta: {drift.get('row_count_change', 'unknown')}. Added cols: {drift.get('columns_added', [])}. Removed: {drift.get('columns_removed', [])}."
+        if drift
+        else "No prior version."
+    )
+
+    prompt = (
+        f"You are a data analyst. Generate an analysis plan of up to {limit} steps for this dataset.\n"
+        f"Dataset: {summary.get('name', 'untitled')} | rows={summary.get('rows', '?')} | cols={summary.get('cols', '?')}\n"
+        f"Goal: {goal}\n"
+        f"Columns: {schema_prompt}\n"
+        f"Drift: {drift_hint}\n"
+        f"Backend sources connected: {len(backend_sources)}\n"
+        f"Task types available: {_LLM_TASK_TYPES}\n\n"
+        "Return ONLY valid JSON with two keys:\n"
+        '  "reasoning": one sentence explaining the overall strategy\n'
+        '  "steps": array of steps, each with: type, description, rationale, intent, '
+        "and type-specific fields (e.g. column for count_by/top_n/null_audit/date_range, "
+        "group+value for avg_by, n for top_n)\n"
+        "No markdown, no explanation — JSON only."
+    )
+
+    model = get_chat_model(settings.LLM_PROVIDER)
+    response = model.invoke(prompt)
+    content = getattr(response, "content", str(response))
+
+    # Extract JSON block (handle ```json ... ``` wrapping)
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if not match:
+        raise ValueError("LLM returned no JSON object")
+
+    parsed = json.loads(match.group(0))
+    steps = parsed.get("steps") or []
+    reasoning = str(parsed.get("reasoning", ""))
+    valid = [s for s in steps if isinstance(s, dict) and s.get("type")][:limit]
+    if not valid:
+        raise ValueError("LLM returned empty steps array")
+    return valid, reasoning
+
+
 # Converts summary metadata into a bounded plan of analysis tasks
 # these are derived from the dataset summary, augmented with backend schema info
 def _derive_plan(
@@ -275,8 +357,61 @@ def _derive_plan(
                 if len(plan) >= limit:
                     break
 
+    # Always add deterministic structural tasks if slots remain
+    plan = _extend_plan_with_structural(plan, summary, limit=limit)
+
     if backend_sources:
         plan = _extend_plan_with_backends(plan, backend_sources, limit=limit)
+
+    return plan
+
+
+def _extend_plan_with_structural(
+    plan: list[dict[str, Any]], summary: dict[str, Any], *, limit: int
+) -> list[dict[str, Any]]:
+    """Add deterministic structural tasks (drift, null_audit, date_range, row_delta) to the plan."""
+    existing_types = {e.get("type") for e in plan}
+
+    columns = summary.get("columns") or []
+
+    # null_audit — always useful
+    if "null_audit" not in existing_types and len(plan) < limit:
+        plan.append(_decorate_plan_entry({"type": "null_audit"}))
+
+    # drift_check — only if drift data exists
+    if "drift_check" not in existing_types and summary.get("drift") and len(plan) < limit:
+        plan.append(_decorate_plan_entry({"type": "drift_check"}))
+
+    # row_delta — companion to drift
+    if "row_delta" not in existing_types and summary.get("drift") and len(plan) < limit:
+        plan.append(_decorate_plan_entry({"type": "row_delta"}))
+
+    # date_range — only if datetime columns detected
+    date_cols = [
+        c
+        for c in columns
+        if isinstance(c, dict)
+        and any(tok in str(c.get("dtype", "")).lower() for tok in ("date", "time"))
+    ]
+    if "date_range" not in existing_types and date_cols and len(plan) < limit:
+        plan.append(_decorate_plan_entry({"type": "date_range"}))
+
+    # top_n — for first categorical column not already count_by'd
+    count_by_cols = {e.get("column") for e in plan if e.get("type") == "count_by"}
+    if "top_n" not in existing_types and len(plan) < limit:
+        cat_col = next(
+            (
+                c["name"]
+                for c in columns
+                if isinstance(c, dict)
+                and c.get("name")
+                and str(c.get("dtype", "")).lower() in ("object", "string", "str", "category")
+                and c["name"] not in count_by_cols
+            ),
+            None,
+        )
+        if cat_col:
+            plan.append(_decorate_plan_entry({"type": "top_n", "column": cat_col, "n": 10}))
 
     return plan
 
@@ -323,6 +458,18 @@ def _plan_rationale(entry: dict[str, Any]) -> str:
         return "Estimate averages across groups to surface best/worst performers."
     if task_type == "schema_inventory":
         return "Map external schemas for cross-dataset validation or joins."
+    if task_type == "null_audit":
+        return "Flag columns with high null rates that may indicate data quality issues."
+    if task_type == "drift_check":
+        return "Detect schema and row-count drift vs. the previous feed version."
+    if task_type == "top_n":
+        return "Surface top N values to quickly understand column value distribution."
+    if task_type == "correlation_hint":
+        return "Identify highly correlated numeric columns to flag redundancy or confounds."
+    if task_type == "date_range":
+        return "Establish temporal boundaries across all date/datetime columns."
+    if task_type == "row_delta":
+        return "Quantify row count change to detect unexpected data growth or loss."
     return "Derive a targeted insight from available profile metadata."
 
 
@@ -334,6 +481,18 @@ def _plan_intent(entry: dict[str, Any]) -> str:
         return "Compare group-level numeric signals."
     if task_type == "schema_inventory":
         return "Summarize available tables and columns."
+    if task_type == "null_audit":
+        return "Identify data completeness issues."
+    if task_type == "drift_check":
+        return "Detect structural or volume changes."
+    if task_type == "top_n":
+        return "Enumerate dominant values."
+    if task_type == "correlation_hint":
+        return "Find correlated numeric dimensions."
+    if task_type == "date_range":
+        return "Determine temporal data coverage."
+    if task_type == "row_delta":
+        return "Measure data volume change."
     return "Execute a targeted data insight step."
 
 
@@ -349,6 +508,19 @@ def _task_description(entry: dict[str, Any]) -> str:
     if task_type == "schema_inventory":
         conn = entry.get("connection_name") or entry.get("kind") or "connection"
         return f"Inventory schema {entry.get('schema', '?')} on {conn}"
+    if task_type == "null_audit":
+        col = entry.get("column")
+        return f"Null audit{f': {col}' if col else ' across all columns'}"
+    if task_type == "drift_check":
+        return "Schema + row-count drift vs. previous version"
+    if task_type == "top_n":
+        return f"Top {entry.get('n', 10)} values in {entry.get('column', '?')}"
+    if task_type == "correlation_hint":
+        return "Numeric column correlation scan"
+    if task_type == "date_range":
+        return f"Date range for {entry.get('column', 'all datetime columns')}"
+    if task_type == "row_delta":
+        return "Row count delta vs. previous version"
     return f"Execute plan step: {task_type}"
 
 
@@ -430,6 +602,129 @@ def _execute_task(
         result, warning = _execute_schema_inventory(task, backend_sources=backend_sources)
         if warning:
             warnings.append(warning)
+
+    elif task_type == "null_audit":
+        columns = summary.get("columns") or []
+        target_col = str(payload.get("column", "")).strip()
+        if target_col:
+            columns = [c for c in columns if isinstance(c, dict) and c.get("name") == target_col]
+        flagged = [
+            {"column": c["name"], "null_percent": round(float(c.get("null_percent", 0)), 2)}
+            for c in columns
+            if isinstance(c, dict) and c.get("name") and float(c.get("null_percent", 0)) > 5
+        ]
+        result = AgentResult(
+            task_id=task["id"],
+            type="null_audit",
+            description=task["description"],
+            data={
+                "flagged_columns": flagged,
+                "total_checked": len(columns),
+                "flagged_count": len(flagged),
+            },
+            rationale=_task_rationale(task),
+        )
+
+    elif task_type == "drift_check":
+        drift = summary.get("drift") or {}
+        result = AgentResult(
+            task_id=task["id"],
+            type="drift_check",
+            description=task["description"],
+            data=drift if drift else {"note": "No prior version available for comparison."},
+            rationale=_task_rationale(task),
+        )
+
+    elif task_type == "top_n":
+        column = str(payload.get("column", "")).strip()
+        n = int(payload.get("n", 10))
+        cols = summary.get("columns") or []
+        col_data = next((c for c in cols if isinstance(c, dict) and c.get("name") == column), None)
+        top_values = ((col_data or {}).get("top_values") or [])[:n]
+        result = AgentResult(
+            task_id=task["id"],
+            type="top_n",
+            description=task["description"],
+            data={"column": column, "top_values": top_values, "n": n},
+            rationale=_task_rationale(task),
+        )
+        if not top_values:
+            warnings.append(f"No top_values data for column {column!r}.")
+
+    elif task_type == "correlation_hint":
+        correlations = (
+            summary.get("correlations") or (summary.get("profile") or {}).get("correlations") or {}
+        )
+        strong_pairs: list[dict[str, Any]] = []
+        if isinstance(correlations, dict):
+            for col_a, corr_map in correlations.items():
+                if not isinstance(corr_map, dict):
+                    continue
+                for col_b, corr_val in corr_map.items():
+                    if col_a >= col_b:
+                        continue
+                    try:
+                        val = float(corr_val)
+                    except (TypeError, ValueError):
+                        continue
+                    if abs(val) >= 0.7:
+                        strong_pairs.append(
+                            {"col_a": col_a, "col_b": col_b, "correlation": round(val, 3)}
+                        )
+        result = AgentResult(
+            task_id=task["id"],
+            type="correlation_hint",
+            description=task["description"],
+            data={"strong_pairs": strong_pairs, "threshold": 0.7},
+            rationale=_task_rationale(task),
+        )
+
+    elif task_type == "date_range":
+        target_col = str(payload.get("column", "")).strip()
+        cols = summary.get("columns") or []
+        date_cols = [
+            c
+            for c in cols
+            if isinstance(c, dict)
+            and c.get("name")
+            and any(tok in str(c.get("dtype", "")).lower() for tok in ("date", "time"))
+            and (not target_col or c["name"] == target_col)
+        ]
+        ranges = [
+            {
+                "column": c["name"],
+                "min": (c.get("stats") or {}).get("min"),
+                "max": (c.get("stats") or {}).get("max"),
+            }
+            for c in date_cols
+        ]
+        result = AgentResult(
+            task_id=task["id"],
+            type="date_range",
+            description=task["description"],
+            data={"date_ranges": ranges, "columns_checked": len(date_cols)},
+            rationale=_task_rationale(task),
+        )
+        if not ranges:
+            warnings.append("No datetime columns found for date_range task.")
+
+    elif task_type == "row_delta":
+        drift = summary.get("drift") or {}
+        row_change = drift.get("row_count_change")
+        prev_rows = drift.get("previous_row_count")
+        curr_rows = summary.get("rows") or summary.get("row_count")
+        result = AgentResult(
+            task_id=task["id"],
+            type="row_delta",
+            description=task["description"],
+            data={
+                "current_rows": curr_rows,
+                "previous_rows": prev_rows,
+                "row_delta": row_change,
+                "has_prior_version": prev_rows is not None,
+            },
+            rationale=_task_rationale(task),
+        )
 
     else:
         fallback_data, fallback_warning = _fallback_tooling(task_type or "task", payload, summary)
@@ -626,6 +921,48 @@ def _summarise_result(result: AgentResult) -> str:
         else:
             formatted = "no tables discovered"
         return f"{schema} on {connection}: {formatted}"
+    if result.get("type") == "null_audit":
+        flagged = data.get("flagged_columns") or []
+        total = data.get("total_checked", 0)
+        if flagged:
+            names = ", ".join(f"{f['column']} ({f['null_percent']}%)" for f in flagged[:4])
+            return f"{len(flagged)}/{total} columns have >5% nulls: {names}"
+        return f"All {total} columns below 5% null threshold."
+    if result.get("type") == "drift_check":
+        if not data or data.get("note"):
+            return "No prior version for drift comparison."
+        row_chg = data.get("row_count_change", "?")
+        added = data.get("columns_added") or []
+        removed = data.get("columns_removed") or []
+        return f"Row delta: {row_chg}. Added cols: {added}. Removed: {removed}."
+    if result.get("type") == "top_n":
+        col = data.get("column")
+        vals = data.get("top_values") or []
+        formatted = ", ".join(str(v.get("value") or v) for v in vals[:5])
+        return f"{col} top values: {formatted}"
+    if result.get("type") == "correlation_hint":
+        pairs = data.get("strong_pairs") or []
+        if not pairs:
+            return "No strong correlations (≥0.7) found."
+        formatted = ", ".join(f"{p['col_a']}↔{p['col_b']} ({p['correlation']})" for p in pairs[:4])
+        return f"Strong correlations: {formatted}"
+    if result.get("type") == "date_range":
+        ranges = data.get("date_ranges") or []
+        if not ranges:
+            return "No datetime columns found."
+        formatted = "; ".join(f"{r['column']}: {r['min']} → {r['max']}" for r in ranges[:3])
+        return formatted
+    if result.get("type") == "row_delta":
+        delta = data.get("row_delta")
+        curr = data.get("current_rows")
+        prev = data.get("previous_rows")
+        if not data.get("has_prior_version"):
+            return f"Current rows: {curr} (no prior version)."
+        return (
+            f"Rows: {prev} → {curr} (delta: {delta:+d})"
+            if isinstance(delta, int)
+            else f"Rows: {curr} (prev: {prev})"
+        )
     note = data
     return f"{result.get('description')}: {note}"
 
@@ -690,20 +1027,40 @@ def _compiled_graph() -> Any:
 
     def planner_node(state: AgentState) -> dict[str, Any]:
         summary = state.get("summary", {})
-        plan = _derive_plan(
-            summary,
-            limit=state.get("max_plan_steps", 12),
-            backend_sources=state.get("backend_sources", []),
-        )
+        goal = state.get("goal", "")
+        limit = state.get("max_plan_steps", 12)
+        backend_sources = state.get("backend_sources", [])
+        plan_reasoning = ""
+        planner_used = "deterministic"
+
+        # Try LLM planner; fall back to deterministic on any failure
+        try:
+            llm_steps, plan_reasoning = _llm_derive_plan(summary, goal, backend_sources, limit)
+            # Decorate with rationale/intent if not already present
+            plan = [_decorate_plan_entry(s) for s in llm_steps]
+            planner_used = "llm"
+        except Exception as exc:  # noqa: BLE001
+            logger.info("LLM planner skipped (%s) — using deterministic fallback.", exc)
+            plan = _derive_plan(summary, limit=limit, backend_sources=backend_sources)
+
         tasks = _build_tasks(plan, existing=state.get("tasks"))
+        trace_entry = {
+            "agent": "planner",
+            "action": "plan_generated",
+            "rationale": plan_reasoning or f"Generated {len(plan)} analysis steps.",
+            "planner_used": planner_used,
+            "timestamp": time.time(),
+        }
         log_entry = {
             "agent": "planner",
-            "message": f"Planner produced {len(plan)} steps.",
-            "goal": state.get("goal"),
+            "message": f"Planner ({planner_used}) produced {len(plan)} steps.",
+            "goal": goal,
         }
         return {
             "plan": plan,
             "tasks": tasks,
+            "plan_reasoning": plan_reasoning,
+            "agent_trace": [*state.get("agent_trace", []), trace_entry],
             "run_log": [*state.get("run_log", []), log_entry],
         }
 
@@ -712,7 +1069,9 @@ def _compiled_graph() -> Any:
         backend_sources = state.get("backend_sources", [])
         completed = list(state.get("completed", []))
         warnings = list(state.get("warnings", []))
-        for task in state.get("tasks", []):
+        trace = list(state.get("agent_trace", []))
+        tasks = state.get("tasks", [])
+        for task in tasks:
             result, task_warnings = _execute_task(
                 task,
                 summary=summary,
@@ -721,14 +1080,26 @@ def _compiled_graph() -> Any:
             warnings.extend(task_warnings)
             if result:
                 completed.append(result)
+            trace.append(
+                {
+                    "agent": "executor",
+                    "action": task.get("type", "task"),
+                    "task_id": task.get("id"),
+                    "description": task.get("description"),
+                    "rationale": task.get("rationale", ""),
+                    "status": "ok" if result else "skipped",
+                    "timestamp": time.time(),
+                }
+            )
         log_entry = {
             "agent": "executor",
-            "message": f"Executed {len(state.get('tasks', []))} tasks.",
+            "message": f"Executed {len(tasks)} tasks, {len(completed)} results.",
         }
         return {
             "completed": completed,
             "tasks": [],
             "warnings": warnings,
+            "agent_trace": trace,
             "run_log": [*state.get("run_log", []), log_entry],
         }
 
@@ -913,6 +1284,8 @@ def run_multi_agent_session(
         "final_report": "",
         "retrieval_k": retrieval_k,
         "max_plan_steps": max_plan_steps,
+        "agent_trace": [],
+        "plan_reasoning": "",
     }
     compiled = _compiled_graph()
     state = compiled.invoke(initial_state)

@@ -112,6 +112,22 @@ export async function resetWorkspace(payload: { confirm: boolean }, opts?: DawnR
   });
 }
 
+export async function seedDemo(opts?: DawnRequestOptions) {
+  return dawnRequest<{ ok: boolean; feeds: unknown[]; errors: string[]; agent_ran: boolean; agent_summary: string }>(
+    '/demo/seed',
+    { method: 'POST', ...(opts || {}) }
+  );
+}
+
+export async function fetchFeedDQ(identifier: string, opts?: DawnRequestOptions) {
+  return dawnRequest<{
+    feed: string;
+    version: number;
+    rules: unknown[];
+    summary: { status: string; total: number; pass: number; fail: number; skip: number };
+  }>(`/feeds/${encodeURIComponent(identifier)}/dq`, opts);
+}
+
 export async function fetchFeeds(opts?: DawnRequestOptions) {
   const result = await dawnRequest<{ feeds: FeedRecord[] }>('/feeds', opts);
   return result.feeds;
@@ -205,10 +221,13 @@ export async function queryContext(
   return dawnRequest<{ query: string; answer: string; sources: ContextNote[] }>(url, opts);
 }
 
-export async function chatRag(messages: RagMessage[], opts?: DawnRequestOptions) {
+export async function chatRag(
+  messages: RagMessage[],
+  opts?: DawnRequestOptions & { feedIdentifier?: string | null }
+) {
   return dawnRequest<RagChatResponse>('/rag/chat', {
     method: 'POST',
-    json: { messages },
+    json: { messages, feed_identifier: opts?.feedIdentifier ?? undefined },
     ...(opts || {})
   });
 }

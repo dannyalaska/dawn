@@ -35,6 +35,8 @@ class AgentRunResponse(BaseModel):
     answer_sources: list[dict[str, Any]]
     final_report: str
     run_log: list[dict[str, Any]]
+    agent_trace: list[dict[str, Any]]
+    plan_reasoning: str
 
 
 @router.post("/analyze", response_model=AgentRunResponse)
@@ -67,4 +69,6 @@ def run_agents(payload: AgentRunRequest, current_user: CurrentUser) -> AgentRunR
         answer_sources=state.get("answer_sources", []),
         final_report=state.get("final_report", ""),
         run_log=state.get("run_log", []),
+        agent_trace=state.get("agent_trace", []),
+        plan_reasoning=state.get("plan_reasoning", ""),
     )

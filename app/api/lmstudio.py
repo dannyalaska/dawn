@@ -42,6 +42,7 @@ class LmStudioUseRequest(BaseModel):
     model: str = Field(..., min_length=1)
     base_url: str | None = None
     provider: str | None = "lmstudio"
+    api_key: str | None = None  # for anthropic / openai
 
 
 def _persist_env_vars(updates: dict[str, str | None]) -> None:
@@ -138,14 +139,52 @@ async def unload_lmstudio_model(
     return {"ok": True, "output": output}
 
 
+@router.get("/provider")
+async def get_active_provider(*, current_user: CurrentUser) -> dict:
+    """Return the currently configured LLM provider and model."""
+    from app.core.config import settings  # local import to get live values
+
+    return {
+        "provider": settings.LLM_PROVIDER,
+        "model": {
+            "lmstudio": settings.OPENAI_MODEL,
+            "openai": settings.OPENAI_MODEL,
+            "ollama": settings.OLLAMA_MODEL,
+            "anthropic": settings.ANTHROPIC_MODEL,
+            "stub": "stub",
+        }.get(settings.LLM_PROVIDER, settings.OPENAI_MODEL),
+        "has_api_key": {
+            "anthropic": bool(settings.ANTHROPIC_API_KEY),
+            "openai": bool(settings.OPENAI_API_KEY),
+        },
+    }
+
+
 @router.post("/use")
 async def use_lmstudio_model(
     payload: LmStudioUseRequest,
     *,
     current_user: CurrentUser,
 ) -> dict:
-    updates = {"LLM_PROVIDER": payload.provider or "lmstudio", "OPENAI_MODEL": payload.model}
-    if payload.base_url:
-        updates["OPENAI_BASE_URL"] = payload.base_url
+    provider = payload.provider or "lmstudio"
+    updates: dict[str, str | None] = {"LLM_PROVIDER": provider}
+
+    if provider in ("lmstudio", "openai"):
+        updates["OPENAI_MODEL"] = payload.model
+        if payload.base_url:
+            updates["OPENAI_BASE_URL"] = payload.base_url
+        if payload.api_key:
+            updates["OPENAI_API_KEY"] = payload.api_key
+
+    elif provider == "ollama":
+        updates["OLLAMA_MODEL"] = payload.model
+        if payload.base_url:
+            updates["OLLAMA_BASE_URL"] = payload.base_url
+
+    elif provider == "anthropic":
+        updates["ANTHROPIC_MODEL"] = payload.model
+        if payload.api_key:
+            updates["ANTHROPIC_API_KEY"] = payload.api_key
+
     await run_in_threadpool(_persist_env_vars, updates)
     return {"ok": True, "restart_required": True}

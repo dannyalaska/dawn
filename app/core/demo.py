@@ -5,10 +5,23 @@ Provides sample data and a guided tour script.
 
 from __future__ import annotations
 
+import logging
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# Path to the bundled demo workbook shipped in /docs
+_DEMO_WORKBOOK = Path(__file__).resolve().parents[2] / "docs" / "DAWN_Demo_Workbook.xlsx"
+
+# Sheets to ingest and their feed identifiers
+_DEMO_FEEDS: list[dict[str, str]] = [
+    {"sheet": "Ticketing Data", "identifier": "demo_tickets", "name": "Demo – Ticketing Data"},
+    {"sheet": "Sales Revenue", "identifier": "demo_sales", "name": "Demo – Sales Revenue"},
+]
 
 # Sample data for demo
 SAMPLE_SUPPORT_TICKETS = {
@@ -264,3 +277,98 @@ def get_guided_tour_steps() -> list[dict[str, Any]]:
             "action": "end",
         },
     ]
+
+
+def seed_demo_workspace(*, user_id: int) -> dict[str, Any]:
+    """
+    Ingest demo sheets from the bundled workbook and run agent analysis on
+    the ticketing dataset. Idempotent — skips feeds that already exist.
+    Returns a status dict with seeded feed identifiers.
+    """
+    from app.core.feed_ingest import FeedIngestConflict, ingest_feed  # noqa: PLC0415
+
+    if not _DEMO_WORKBOOK.exists():
+        return {
+            "ok": False,
+            "message": f"Demo workbook not found at {_DEMO_WORKBOOK}",
+            "feeds": [],
+        }
+
+    workbook_bytes = _DEMO_WORKBOOK.read_bytes()
+    seeded: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for feed_def in _DEMO_FEEDS:
+        identifier = feed_def["identifier"]
+        try:
+            result = ingest_feed(
+                identifier=identifier,
+                name=feed_def["name"],
+                source_kind="upload",
+                data_format="excel",
+                owner=None,
+                file_bytes=workbook_bytes,
+                filename=_DEMO_WORKBOOK.name,
+                sheet=feed_def["sheet"],
+                s3_path=None,
+                http_url=None,
+                user_id=user_id,
+                confirm_update=False,
+            )
+            seeded.append(
+                {
+                    "identifier": identifier,
+                    "name": feed_def["name"],
+                    "sheet": feed_def["sheet"],
+                    "rows": result.get("version", {}).get("rows"),
+                    "status": "ingested",
+                }
+            )
+            logger.info(
+                "Demo seed: ingested feed %r (%s rows)",
+                identifier,
+                result.get("version", {}).get("rows"),
+            )
+        except FeedIngestConflict:
+            seeded.append(
+                {
+                    "identifier": identifier,
+                    "name": feed_def["name"],
+                    "sheet": feed_def["sheet"],
+                    "status": "already_exists",
+                }
+            )
+            logger.info("Demo seed: feed %r already exists — skipping", identifier)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{identifier}: {exc}")
+            logger.warning("Demo seed: failed to ingest %r: %s", identifier, exc)
+
+    # Run agent analysis on the ticketing feed (best-effort)
+    agent_result: dict[str, Any] = {}
+    primary_feed = _DEMO_FEEDS[0]["identifier"]
+    primary_seeded = next(
+        (f for f in seeded if f["identifier"] == primary_feed and f.get("status") == "ingested"),
+        None,
+    )
+    if primary_seeded:
+        try:
+            from app.core.agent_graph import run_multi_agent_session  # noqa: PLC0415
+
+            agent_result = run_multi_agent_session(
+                feed_identifier=primary_feed,
+                user_id=str(user_id),
+                question="What are the key patterns and issues in this ticketing data?",
+                refresh_context=True,
+                max_plan_steps=8,
+            )
+            logger.info("Demo seed: agent analysis complete for %r", primary_feed)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Demo seed: agent analysis failed for %r: %s", primary_feed, exc)
+
+    return {
+        "ok": len(errors) == 0,
+        "feeds": seeded,
+        "errors": errors,
+        "agent_ran": bool(agent_result),
+        "agent_summary": agent_result.get("final_report", "")[:500] if agent_result else "",
+    }

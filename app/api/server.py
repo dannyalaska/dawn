@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from typing import Any
@@ -97,7 +96,7 @@ def _check_llm() -> dict[str, Any]:
     elif provider == "ollama":
         endpoint = "http://127.0.0.1:11434/api/tags"
     elif provider == "lmstudio":
-        base = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234").rstrip("/")
+        base = (settings.OPENAI_BASE_URL or "http://127.0.0.1:1234").rstrip("/")
         endpoint = f"{base}/models"
     elif provider == "openai":
         endpoint = "https://api.openai.com/v1/models"
@@ -107,10 +106,10 @@ def _check_llm() -> dict[str, Any]:
     if endpoint:
         try:
             headers = {}
-            if provider == "openai":
-                headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY', '')}"
-            if provider == "anthropic":
-                headers["x-api-key"] = os.getenv("ANTHROPIC_API_KEY", "")
+            if provider == "openai" and settings.OPENAI_API_KEY:
+                headers["Authorization"] = f"Bearer {settings.OPENAI_API_KEY}"
+            if provider == "anthropic" and settings.ANTHROPIC_API_KEY:
+                headers["x-api-key"] = settings.ANTHROPIC_API_KEY
             resp = requests.get(endpoint, timeout=2, headers=headers or None)
             resp.raise_for_status()
             detail = "Endpoint reachable"
@@ -131,7 +130,7 @@ def _require_dependencies() -> None:
             errors.append(f"Redis unavailable: {exc}")
 
     if settings.REQUIRE_POSTGRES:
-        dsn = os.getenv("POSTGRES_DSN") or settings.POSTGRES_DSN
+        dsn = settings.POSTGRES_DSN
         if not dsn:
             errors.append("POSTGRES_DSN is required when REQUIRE_POSTGRES=true.")
         else:

@@ -194,6 +194,20 @@ export interface RagChatResponse {
   sources: Array<Record<string, unknown>>;
   messages: RagMessage[];
   direct_answer?: boolean;
+  sql_result?: {
+    sql: string;
+    rows: Array<Record<string, unknown>>;
+    columns: string[];
+    row_count: number;
+    truncated: boolean;
+    validation?: {
+      ok?: boolean;
+      errors?: string[];
+      warnings?: string[];
+      tables?: string[];
+      columns?: string[];
+    };
+  };
 }
 
 export interface NL2SQLContextHit {

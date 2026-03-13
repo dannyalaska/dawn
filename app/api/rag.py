@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 from io import BytesIO
 from typing import Any, Literal
 
@@ -17,10 +18,12 @@ from sqlalchemy import select
 
 from app.core.auth import CurrentUser
 from app.core.chat_graph import run_chat
+from app.core.chat_models import StubChatModel, get_chat_model
 from app.core.db import session_scope
 from app.core.excel.summary import summarize_dataframe
 from app.core.limits import SizeLimitError, read_upload_bytes
 from app.core.models import Upload
+from app.core.nl2sql import TableManifest, execute_sql, nl_to_sql_for_feed_dataset
 from app.core.rag import (
     Chunk,
     add_manual_note,
@@ -267,6 +270,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     k: int = Field(default=12, ge=1, le=50)
+    feed_identifier: str | None = None
 
 
 class ContextUpdateRequest(BaseModel):
@@ -291,6 +295,204 @@ class MemoryUpdateRequest(BaseModel):
 @router.post("/chat")
 def rag_chat(payload: ChatRequest, current_user: CurrentUser) -> dict[str, Any]:
     message_dicts = [msg.model_dump() for msg in payload.messages]
+    feed_identifier = payload.feed_identifier
+    question = message_dicts[-1].get("content", "")
+
+    if feed_identifier:
+        sql_result = nl_to_sql_for_feed_dataset(
+            question,
+            feed_identifier=feed_identifier,
+            user_id=str(current_user.id),
+        )
+
+        def _should_execute_sql() -> bool:
+            intent = sql_result.get("intent") or {}
+            task = str(intent.get("task", "")).lower()
+            if task and task not in {"unknown", "describe", "definition", "explain"}:
+                return True
+            if intent.get("columns") or intent.get("group_by"):
+                return True
+            lowered = question.lower()
+            keywords = [
+                "average",
+                "avg",
+                "mean",
+                "count",
+                "number of",
+                "sum",
+                "total",
+                "min",
+                "max",
+                "median",
+                "percent",
+                "percentage",
+                "rate",
+                "trend",
+                "over time",
+                "by ",
+                "group",
+                "breakdown",
+                "top",
+                "highest",
+                "lowest",
+                "most",
+                "least",
+                "duplicate",
+                "unique",
+                "distribution",
+                "priority",
+                "status",
+                "assignee",
+                "tickets",
+                "list",
+                "show",
+                "resolve",
+                "resolution",
+            ]
+            return any(term in lowered for term in keywords)
+
+        if _should_execute_sql():
+
+            def _wants_list(question_text: str) -> bool:
+                lowered = question_text.lower()
+                list_terms = [
+                    "show",
+                    "list",
+                    "display",
+                    "give me",
+                    "see all",
+                    "all rows",
+                    "show me",
+                ]
+                return any(term in lowered for term in list_terms)
+
+            def _format_value(value: Any) -> str:
+                if value is None:
+                    return "null"
+                if isinstance(value, float):
+                    return f"{value:,.2f}"
+                if isinstance(value, int):
+                    return f"{value:,}"
+                return str(value)
+
+            def _summarize_with_llm(execution: dict[str, Any]) -> str:
+                if not execution.get("ok"):
+                    error = execution.get("error")
+                    if error:
+                        return f"I couldn't run SQL for this question. {error}"
+                    return (
+                        "I couldn't run SQL for this question. Please check the SQL and try again."
+                    )
+                rows = execution.get("rows") or []
+                columns = execution.get("columns") or []
+                row_count = execution.get("row_count", len(rows))
+                truncated = execution.get("truncated", False)
+                if not rows:
+                    return "I ran the query but it returned no rows."
+                if row_count == 1 and len(columns) == 1:
+                    col = columns[0]
+                    return f"{col}: {_format_value(rows[0].get(col))}."
+                if row_count > 1 and len(columns) > 1:
+                    return (
+                        f"Found {row_count} rows matching your question. Open Preview for details."
+                    )
+
+                sample_rows = rows[: min(50, len(rows))]
+                payload = {
+                    "question": question,
+                    "row_count": row_count,
+                    "truncated": truncated,
+                    "columns": columns,
+                    "rows": sample_rows,
+                }
+                model = get_chat_model(os.getenv("LLM_PROVIDER") or "stub")
+                if isinstance(model, StubChatModel):
+                    return (
+                        f"Returned {row_count} rows. Open Preview for details."
+                        if row_count > 1
+                        else "I ran the query and returned one row."
+                    )
+                prompt = (
+                    "You answer questions using SQL result rows only.\n"
+                    "Answer in 1-2 short sentences. If the question implies listing rows, "
+                    "say the results are shown (capped at 500) and do not summarize.\n"
+                    f"Question: {question}\n"
+                    f"Rows (JSON): {json.dumps(payload, ensure_ascii=True)}\n"
+                )
+                try:
+                    answer = model.invoke(prompt)
+                    if isinstance(answer, str):
+                        return answer.strip()
+                    content = getattr(answer, "content", None)
+                    if isinstance(content, str):
+                        return content.strip()
+                    return str(answer).strip()
+                except Exception:
+                    return f"Returned {row_count} rows. Open Preview for details."
+
+            manifest_payload = sql_result.get("manifest") or []
+            if not manifest_payload or not sql_result.get("validation", {}).get("ok"):
+                result = {
+                    "answer": "I couldn't run SQL because there is no active feed dataset yet.",
+                    "sources": [],
+                    "messages": message_dicts
+                    + [
+                        {
+                            "role": "assistant",
+                            "content": "I couldn't run SQL because there is no active feed dataset yet.",
+                        }
+                    ],
+                    "direct_answer": False,
+                    "sql_result": {
+                        "sql": sql_result.get("sql", ""),
+                        "rows": [],
+                        "columns": [],
+                        "row_count": 0,
+                        "truncated": False,
+                        "validation": sql_result.get("validation"),
+                    },
+                }
+                return result
+
+            execution = execute_sql(
+                sql_result.get("sql", ""),
+                manifest=[TableManifest(**m) for m in manifest_payload],
+                dialect="postgres",
+                limit=500,
+            )
+            if not execution.get("ok"):
+                answer = _summarize_with_llm(execution)
+            elif _wants_list(question):
+                row_count = execution.get("row_count", 0)
+                truncated = execution.get("truncated", False)
+                answer = (
+                    f"Showing {row_count} rows (capped at 500). Open Preview for details."
+                    if truncated
+                    else f"Showing {row_count} rows. Open Preview for details."
+                )
+            else:
+                answer = _summarize_with_llm(execution)
+            return {
+                "answer": answer,
+                "sources": [],
+                "messages": message_dicts
+                + [
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                    }
+                ],
+                "direct_answer": False,
+                "sql_result": {
+                    "sql": execution.get("sql") or sql_result.get("sql", ""),
+                    "rows": execution.get("rows", []),
+                    "columns": execution.get("columns", []),
+                    "row_count": execution.get("row_count", 0),
+                    "truncated": execution.get("truncated", False),
+                    "validation": execution.get("validation", sql_result.get("validation")),
+                },
+            }
+
     try:
         result = run_chat(message_dicts, k=payload.k, user_id=str(current_user.id))
     except ValueError as exc:

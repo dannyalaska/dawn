@@ -13,6 +13,10 @@ type SqlPreview = {
   sql: string;
   details?: string;
   validation?: { ok?: boolean; errors?: string[]; warnings?: string[] };
+  rows?: Array<Record<string, unknown>>;
+  columns?: string[];
+  row_count?: number;
+  truncated?: boolean;
   receivedAt: string;
 };
 
@@ -40,6 +44,10 @@ export default function PreviewPanel({ preview }: PreviewPanelProps) {
         sql: String(detail.sql || ''),
         details: detail.details ? String(detail.details) : undefined,
         validation: detail.validation?.validation ?? detail.validation?.detail?.validation ?? detail.validation,
+        rows: Array.isArray(detail.rows) ? detail.rows : undefined,
+        columns: Array.isArray(detail.columns) ? detail.columns : undefined,
+        row_count: typeof detail.row_count === 'number' ? detail.row_count : undefined,
+        truncated: Boolean(detail.truncated),
         receivedAt: new Date().toISOString()
       });
     };
@@ -97,6 +105,46 @@ export default function PreviewPanel({ preview }: PreviewPanelProps) {
                 {sqlPreview.validation?.errors?.length ? (
                   <p>Errors: {sqlPreview.validation.errors.join(' · ')}</p>
                 ) : null}
+              </div>
+            )}
+            {sqlPreview.rows && sqlPreview.rows.length > 0 && (
+              <div className="mt-4">
+                <p className="mb-2 text-[11px] uppercase tracking-[0.3em] text-emerald-300">
+                  Results {sqlPreview.row_count !== undefined ? `· ${sqlPreview.row_count} rows` : ''}
+                  {sqlPreview.truncated ? ' (capped at 500)' : ''}
+                </p>
+                <div className="max-h-56 overflow-auto rounded-xl border border-emerald-400/20">
+                  <table className="min-w-full divide-y divide-emerald-400/20 text-[11px] text-emerald-100">
+                    <thead className="bg-emerald-500/10">
+                      <tr>
+                        {(sqlPreview.columns?.length
+                          ? sqlPreview.columns
+                          : Object.keys(sqlPreview.rows[0] || {})
+                        ).map((col) => (
+                          <th key={col} className="px-3 py-2 text-left uppercase tracking-[0.2em] text-emerald-200">
+                            {col}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sqlPreview.rows.map((row, idx) => {
+                        const cols = sqlPreview.columns?.length
+                          ? sqlPreview.columns
+                          : Object.keys(row || {});
+                        return (
+                          <tr key={idx} className="border-b border-emerald-400/10">
+                            {cols.map((col) => (
+                              <td key={col} className="px-3 py-2 text-[11px] text-emerald-100">
+                                {row[col] !== null && row[col] !== undefined ? String(row[col]) : ''}
+                              </td>
+                            ))}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             )}
           </div>

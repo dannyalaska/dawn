@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os
+import logging
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
@@ -8,6 +8,8 @@ from langchain_community.chat_models import ChatOllama
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
+
+from app.core.config import settings
 
 
 class StubChatModel(BaseChatModel):
@@ -41,8 +43,7 @@ class StubChatModel(BaseChatModel):
 
 
 def _normalized_lmstudio_base_url() -> str:
-    base = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234")
-    base = base.rstrip("/")
+    base = (settings.OPENAI_BASE_URL or "http://127.0.0.1:1234").rstrip("/")
     if not base.endswith("/v1"):
         base = f"{base}/v1"
     return base
@@ -53,26 +54,22 @@ def get_chat_model(provider: str) -> BaseChatModel:
 
     try:
         if provider == "openai":
-            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-            api_key = os.getenv("OPENAI_API_KEY")
-            base_url = os.getenv("OPENAI_BASE_URL")
             init_kwargs: dict[str, Any] = {
-                "model": model,
+                "model": settings.OPENAI_MODEL,
                 "temperature": 0.1,
                 "max_retries": 2,
             }
-            if api_key:
-                init_kwargs["api_key"] = SecretStr(api_key)
-            if base_url:
-                init_kwargs["base_url"] = base_url.rstrip("/")
+            if settings.OPENAI_API_KEY:
+                init_kwargs["api_key"] = SecretStr(settings.OPENAI_API_KEY)
+            if settings.OPENAI_BASE_URL:
+                init_kwargs["base_url"] = settings.OPENAI_BASE_URL.rstrip("/")
             return ChatOpenAI(**init_kwargs)
 
         if provider == "lmstudio":
-            model = os.getenv("OPENAI_MODEL", "mistral-7b-instruct-v0.3")
             base_url = _normalized_lmstudio_base_url()
-            api_key = os.getenv("OPENAI_API_KEY", "lm-studio")
+            api_key = settings.OPENAI_API_KEY or "lm-studio"
             return ChatOpenAI(
-                model=model,
+                model=settings.OPENAI_MODEL,
                 base_url=base_url,
                 api_key=SecretStr(api_key),
                 temperature=0.1,
@@ -80,20 +77,23 @@ def get_chat_model(provider: str) -> BaseChatModel:
             )
 
         if provider == "ollama":
-            model = os.getenv("OLLAMA_MODEL", "llama3.1")
-            base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-            return ChatOllama(model=model, base_url=base_url.rstrip("/"), temperature=0.1)
+            return ChatOllama(
+                model=settings.OLLAMA_MODEL,
+                base_url=settings.OLLAMA_BASE_URL.rstrip("/"),
+                temperature=0.1,
+            )
 
         if provider == "anthropic":
-            model = os.getenv("ANTHROPIC_MODEL", "claude-3-sonnet-20240229")
-            api_key = os.getenv("ANTHROPIC_API_KEY")
-            init_kwargs = {"model": model, "temperature": 0.1}
-            if api_key:
-                init_kwargs["api_key"] = SecretStr(api_key)
+            init_kwargs = {"model": settings.ANTHROPIC_MODEL, "temperature": 0.1}
+            if settings.ANTHROPIC_API_KEY:
+                init_kwargs["api_key"] = SecretStr(settings.ANTHROPIC_API_KEY)
             return ChatAnthropic(**init_kwargs)
 
-    except Exception:  # noqa: BLE001
-        # Fall back to stub model if provider initialisation fails.
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logging.warning(
+            "chat_models: failed to init provider=%s (%s) — falling back to stub",
+            provider,
+            exc,
+        )
 
     return StubChatModel()

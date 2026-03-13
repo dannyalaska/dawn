@@ -10,6 +10,7 @@ from app.core.auth import CurrentUser
 from app.core.backend_connectors import (
     SUPPORTED_SCHEMA_BACKENDS,
     BackendConnectorError,
+    execute_query,
     get_schema_grants,
     list_backend_schemas,
     normalize_schema_list,
@@ -159,6 +160,29 @@ def backend_schemas(connection_id: int, current_user: CurrentUser) -> dict[str, 
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         grants = get_schema_grants(config)
     return {"schemas": schemas, "grants": grants}
+
+
+class BackendQueryRequest(BaseModel):
+    sql: str = Field(min_length=1, description="Read-only SQL to execute against the backend.")
+    row_limit: int = Field(default=500, ge=1, le=5000)
+
+
+@router.post("/{connection_id}/query")
+def backend_query(
+    connection_id: int,
+    payload: BackendQueryRequest,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
+    """Execute a read-only SQL query against a backend connection."""
+    with session_scope() as session:
+        connection = _load_connection(session, connection_id, current_user.id)
+        kind = connection.kind
+        config = dict(connection.config or {})
+
+    result = execute_query(kind, config, payload.sql, row_limit=payload.row_limit)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Query failed"))
+    return result
 
 
 @router.post("/{connection_id}/schemas/grant")
